@@ -4,7 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-TOKEN = " "
+TOKEN = ""
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -12,6 +12,7 @@ sched = AsyncIOScheduler()
 reminders = []
 jobs = []
 user_stats = {}
+user_temp = {}
 
 async def remind_me(chat_id, text):
     await bot.send_message(chat_id, "Напоминание " + text)
@@ -82,15 +83,36 @@ async def clear_all_callback(callback: CallbackQuery):
 async def show_help_callback(callback: CallbackQuery):
     text = (
         "Доступные команды:\n"
-        "/remind — создать напоминание\n"
-        "/list — список напоминаний\n"
-        "/clear — удалить все напоминания\n"
-        "/stats — показать статистику\n"
-        "/help — справка\n\n"
-        "Также можно использовать кнопки меню для удобства."
+        "/remind - создать напоминание\n"
+        "/list - список напоминаний\n"
+        "/clear - удалить все напоминания\n"
+        "/stats - показать статистику\n"
+        "/help - справка\n\n"
+        "/at - что бы использовать напоминания через формат НН:ММ."
     )
     await callback.message.reply(text)
     await callback.answer()
+
+@dp.message(Command("at"))
+async def at_cmd(message: types.Message):
+    txt = message.text.split(" ", 2)
+    if len(txt) < 3:
+        await message.reply("Используй формат: /at HH:MM текст напоминания\nНапример: /at 13:00 Проверить задачи")
+        return
+    time_str, reminder_text = txt[1], txt[2]
+    try:
+        target_time = datetime.strptime(time_str, "%H:%M").time()
+    except ValueError:
+        await message.reply("Неверный формат времени! Используй HH:MM, например 09:45")
+        return
+
+    now = datetime.now()
+    target_datetime = datetime.combine(now.date(), target_time)
+    if target_datetime <= now:
+        target_datetime += timedelta(days=1)
+    sched.add_job(remind_me, "date", run_date=target_datetime, args=[message.chat.id, reminder_text])
+    reminders.append(("по времени", target_datetime.strftime("%H:%M"), reminder_text))
+    await message.reply(f"Напоминание установлено на {target_datetime.strftime('%H:%M')} — {reminder_text}")
 
 async def main():
     sched.start()
