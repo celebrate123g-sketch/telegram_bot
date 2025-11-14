@@ -152,6 +152,27 @@ async def atd_cmd(message: types.Message):
     user_stats[message.chat.id]["created"] += 1
     await message.reply(f"Ежедневное напоминание установлено на {time_str} — {reminder_text}")
 
+@dp.message(Command("on"))
+async def on_date_cmd(message: types.Message):
+    data = message.text.split(" ", 3)
+    if len(data) < 4:
+        await message.reply("Формат: /on YYYY-MM-DD HH:MM текст")
+        return
+    date_str = data[1]
+    time_str = data[2]
+    text = data[3]
+    try:
+        dt = datetime.strptime(date_str + " " + time_str, "%Y-%m-%d %H:%M")
+    except:
+        await message.reply("Ошибка! Используй формат даты и времени правильно!")
+        return
+    if dt <= datetime.now():
+        await message.reply("Эта дата уже прошла.")
+        return
+    sched.add_job(remind_me, "date", run_date=dt, args=[message.chat.id, text])
+    reminders.append((message.chat.id, date_str + " " + time_str, text))
+    await message.reply("Напоминание создано на " + date_str + " " + time_str)
+
 async def main():
     sched.start()
     await dp.start_polling(bot)
