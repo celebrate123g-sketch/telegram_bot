@@ -4,7 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 TOKEN = ""
 
@@ -15,9 +15,20 @@ reminders = []
 user_stats = {}
 
 async def remind_me(chat_id, text):
-    await bot.send_message(chat_id, f"Напоминание: {text}")
-    user_stats.setdefault(chat_id, {"created": 0, "completed": 0, "deleted": 0})
-    user_stats[chat_id]["completed"] += 1
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Выполнил", callback_data=f"done|{text}"),
+                InlineKeyboardButton(text="Нет", callback_data=f"notdone|{text}")
+            ]
+        ]
+    )
+    await bot.send_message(
+        chat_id,
+        f"Напоминание: {text}\nТы сделал это?",
+        reply_markup=kb
+    )
+
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -172,6 +183,23 @@ async def on_date_cmd(message: types.Message):
     sched.add_job(remind_me, "date", run_date=dt, args=[message.chat.id, text])
     reminders.append((message.chat.id, date_str + " " + time_str, text))
     await message.reply("Напоминание создано на " + date_str + " " + time_str)
+
+@dp.callback_query(lambda c: c.data.startswith("done|"))
+async def done_callback(callback: CallbackQuery):
+    text = callback.data.split("|", 1)[1]
+    user_id = callback.from_user.id
+
+    user_stats.setdefault(user_id, {"created": 0, "completed": 0, "deleted": 0})
+    user_stats[user_id]["completed"] += 1
+
+    await callback.message.edit_text(f"Отлично! Ты выполнил: {text}")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("notdone|"))
+async def not_done_callback(callback: CallbackQuery):
+    text = callback.data.split("|", 1)[1]
+    await callback.message.edit_text(f"Ты НЕ выполнил: {text}")
+    await callback.answer()
 
 async def main():
     sched.start()
