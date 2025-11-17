@@ -13,22 +13,23 @@ dp = Dispatcher()
 sched = AsyncIOScheduler()
 reminders = []
 user_stats = {}
+reminder_history = {}
 
-async def remind_me(chat_id, text):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Выполнил", callback_data=f"done|{text}"),
-                InlineKeyboardButton(text="Нет", callback_data=f"notdone|{text}")
-            ]
-        ]
-    )
-    await bot.send_message(
-        chat_id,
-        f"Напоминание: {text}\nТы сделал это?",
-        reply_markup=kb
-    )
+async def reminder_trigger(user_id: int, time: datetime):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Выполнено", callback_data=f"done|{time}")],
+        [InlineKeyboardButton(text="Не выполнено", callback_data=f"missed|{time}")]
+    ])
 
+    await bot.send_message(user_id, f"Напоминание на {time.strftime('%d.%m %H:%M')}", reply_markup=kb)
+
+async def schedule_reminder(user_id: int, time: datetime, scheduler):
+    job = scheduler.add_job(
+        reminder_trigger,
+        "date",
+        run_date=time,
+        args=[user_id, time]
+    )
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -133,7 +134,7 @@ async def time_cmd(message: types.Message):
     target_datetime = datetime.combine(now.date(), target_time)
     if target_datetime <= now:
         target_datetime += timedelta(days=1)
-    sched.add_job(remind_me, "date", run_date=target_datetime, args=[message.chat.id, reminder_text])
+    sched.add_job(reminder_trigger, "date", run_date=target_datetime, args=[message.chat.id, reminder_text])
     reminders.append((message.chat.id, "по времени", target_datetime.strftime("%H:%M"), reminder_text))
     user_stats.setdefault(message.chat.id, {"created":0, "completed":0, "deleted":0})
     user_stats[message.chat.id]["created"] += 1
@@ -152,7 +153,7 @@ async def atd_cmd(message: types.Message):
         await message.reply("Неверный формат времени! Используй HH:MM")
         return
     sched.add_job(
-        remind_me,
+        reminder_trigger,
         "cron",
         hour=target_time.hour,
         minute=target_time.minute,
@@ -180,7 +181,7 @@ async def on_date_cmd(message: types.Message):
     if dt <= datetime.now():
         await message.reply("Эта дата уже прошла.")
         return
-    sched.add_job(remind_me, "date", run_date=dt, args=[message.chat.id, text])
+    sched.add_job(reminder_trigger, "date", run_date=dt, args=[message.chat.id, text])
     reminders.append((message.chat.id, date_str + " " + time_str, text))
     await message.reply("Напоминание создано на " + date_str + " " + time_str)
 
@@ -198,8 +199,37 @@ async def done_callback(callback: CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("notdone|"))
 async def not_done_callback(callback: CallbackQuery):
     text = callback.data.split("|", 1)[1]
-    await callback.message.edit_text(f"Ты НЕ выполнил: {text}")
+    await callback.message.edit_text(f"Ты не выполнил: {text}")
     await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith(("done", "missed")))
+async def confirm_reminder(callback: types.CallbackQuery):
+    action, t = callback.data.split("|")
+    t = datetime.fromisoformat(t)
+    status = "Выполнено" if action == "done" else "Не выполнено"
+    user_id = callback.from_user.id
+    if user_id not in reminder_history:
+        reminder_history[user_id] = []
+    reminder_history[user_id].append({
+        "time": t,
+        "status": status
+    })
+    await callback.message.edit_text(
+        f"Напоминание на {t.strftime('%d.%m %H:%M')} — {status}"
+    )
+
+@dp.message(Command("history"))
+async def history_cmd(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in reminder_history or len(reminder_history[user_id]) == 0:
+        return await message.answer("История пуста")
+    items = sorted(reminder_history[user_id], key=lambda x: x["time"])
+    text = "\n".join(
+        f"{item['time'].strftime('%d.%m %H:%M')} — {item['status']}"
+        for item in items
+    )
+    await message.answer(text)
+
 
 async def main():
     sched.start()
