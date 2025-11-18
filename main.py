@@ -14,6 +14,7 @@ sched = AsyncIOScheduler()
 reminders = []
 user_stats = {}
 reminder_history = {}
+user_temp = {}
 
 async def reminder_trigger(user_id: int, time: datetime):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -229,6 +230,65 @@ async def history_cmd(message: types.Message):
         for item in items
     )
     await message.answer(text)
+
+@dp.callback_query(lambda c: c.data == "list_reminders")
+async def list_reminders_callback(callback: CallbackQuery):
+    if not reminders:
+        await callback.message.reply("У тебя нет напоминаний.")
+        return
+
+    text = "Твои напоминания:\n\n"
+    kb = InlineKeyboardBuilder()
+
+    for i, rem in enumerate(reminders):
+        rem_time = rem.get("time")
+        rem_text = rem.get("text")
+        text += f"{i+1}. {rem_time} — {rem_text}\n"
+
+        kb.button(text=f"Изменить {i+1}", callback_data=f"edit|{i}")
+        kb.button(text=f"Удалить {i+1}", callback_data=f"del|{i}")
+
+    kb.adjust(2)
+    await callback.message.reply(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(lambda c: c.data.startswith("edit"))
+async def edit_reminder_callback(cb: CallbackQuery):
+    edit_index = int(cb.data.split("|")[1])
+    index = int(cb.data.split("|")[1])
+    user_temp[cb.message.chat.id] = index
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Изменить время", callback_data="edit_time")
+    kb.button(text="Изменить текст", callback_data="edit_text")
+    kb.adjust(1)
+
+    await cb.message.reply("Что изменить?", reply_markup=kb.as_markup())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "edit_time")
+async def ask_new_time(cb: CallbackQuery):
+    await cb.message.reply("Введи новое время в формате HH:MM:")
+    user_temp[cb.message.chat.id] = {"mode": "time", "index": user_temp[cb.message.chat.id]}
+    await cb.answer()
+
+@dp.message()
+async def catch_edit_message(msg: types.Message):
+    user_id = msg.chat.id
+
+    if user_id not in user_temp:
+        return
+    temp = user_temp[user_id]
+    if isinstance(temp, dict) and temp.get("mode") == "time":
+        index = temp["index"]
+        try:
+            new_time = datetime.strptime(msg.text, "%H:%M").strftime("%H:%M")
+        except:
+            await msg.reply("Неверный формат! Пример: 19:30")
+            return
+        reminders[index]["time"] = new_time
+        await msg.reply(f"Время изменено на {new_time}")
+        del user_temp[user_id]
 
 
 async def main():
