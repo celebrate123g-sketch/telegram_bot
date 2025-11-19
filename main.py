@@ -275,7 +275,6 @@ async def ask_new_time(cb: CallbackQuery):
 @dp.message()
 async def catch_edit_message(msg: types.Message):
     user_id = msg.chat.id
-
     if user_id not in user_temp:
         return
     temp = user_temp[user_id]
@@ -290,6 +289,25 @@ async def catch_edit_message(msg: types.Message):
         await msg.reply(f"Время изменено на {new_time}")
         del user_temp[user_id]
 
+@dp.callback_query(lambda c: c.data == "edit_text")
+async def ask_new_text(cb: CallbackQuery):
+    user_temp[cb.message.chat.id] = {
+        "mode": "text",
+        "index": user_temp[cb.message.chat.id]
+    }
+    await cb.message.reply("Введи новый текст:")
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("del"))
+async def delete_reminder(cb: CallbackQuery):
+    index = int(cb.data.split("|")[1])
+
+    try:
+        reminders.pop(index)
+        await cb.message.reply("Напоминание удалено.")
+    except:
+        await cb.message.reply("Ошибка удаления.")
+    await cb.answer()
 
 async def main():
     sched.start()
