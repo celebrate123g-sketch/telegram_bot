@@ -6,7 +6,8 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-TOKEN = ""
+TOKEN = "8532049702:AAFpukca2vnRYZDNpzOlssqTNge7RsMAR_I"
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 sched = AsyncIOScheduler()
@@ -50,29 +51,55 @@ async def start_cmd(message: types.Message):
         reply_markup=main_menu()
     )
 
-@dp.callback_query(lambda c: c.data == "add_reminder")
-async def add_reminder_callback(callback: CallbackQuery):
-    await callback.message.reply("Используй команду:\n/at HH:MM текст напоминания")
-    await callback.answer()
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Поставить напоминание", callback_data="menu_add")
+    kb.button(text="Список напоминаний", callback_data="menu_list")
+    kb.adjust(1)
+    return kb.as_markup()
 
-@dp.callback_query(lambda c: c.data == "add_reminder_minutes")
-async def add_reminder_minutes_callback(callback: CallbackQuery):
-    await callback.message.reply("Используй команду:\n/remind 'минуты' 'текст'")
-    await callback.answer()
 
-@dp.callback_query(lambda c: c.data == "add_daily_reminder")
-async def add_daily_reminder_callback(callback: CallbackQuery):
-    await callback.message.reply("Используй команду:\n/atd HH:MM 'текст'")
-    await callback.answer()
+# --- Меню «Поставить напоминание» ---
+def add_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Добавить по времени", callback_data="add_time")
+    kb.button(text="Назад", callback_data="go_back")
+    kb.adjust(1)
+    return kb.as_markup()
 
-@dp.callback_query(lambda c: c.data == "history_btn")
-async def history_btn_cb(cb: CallbackQuery):
-    await history_cmd(cb.message)
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message):
+    user = message.from_user
+    nickname = f"@{user.username}" if user.username else user.first_name
+    def main_menu():
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Поставить напоминание", callback_data="menu_add")
+        kb.button(text="Список напоминаний", callback_data="menu_list")
+        kb.button(text="Статистика", callback_data="menu_stats")
+        kb.button(text="История", callback_data="menu_history")
+        kb.button(text="Справка", callback_data="menu_help")
+        kb.adjust(1)
+        return kb.as_markup()
+    await message.reply(
+        f"Привет, {nickname}! Я бот, который сможет напомнить тебе сделать что-либо. "
+        f"Используй /help чтобы узнать все команды.",
+        reply_markup=main_menu()
+    )
+
+@dp.callback_query(lambda c: c.data == "menu_add")
+async def open_add_menu(cb: types.CallbackQuery):
+    await cb.message.edit_text(
+        "Меню добавления:",
+        reply_markup=add_menu()
+    )
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "add_date")
-async def add_date_cb(cb: CallbackQuery):
-    await cb.message.reply("Используй команду:\n/on YYYY-MM-DD HH:MM текст")
+@dp.callback_query(lambda c: c.data == "go_back")
+async def back_to_main(cb: types.CallbackQuery):
+    await cb.message.edit_text(
+        "Главное меню:",
+        reply_markup=main_menu()
+    )
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "list_reminders")
@@ -80,7 +107,7 @@ async def list_reminders_callback(callback: CallbackQuery):
     user_id = callback.message.chat.id
     user_reminders = [r for r in reminders if r[0] == user_id]
     if not user_reminders:
-        await callback.message.reply("У тебя пока нет напоминаний.")
+        await callback.edit_texty("У тебя пока нет напоминаний.")
     else:
         text = "Твои напоминания:\n"
         for i, (_, r_type, time_str, r_text) in enumerate(user_reminders, start=1):
