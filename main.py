@@ -58,8 +58,6 @@ def main_menu():
     kb.adjust(1)
     return kb.as_markup()
 
-
-# --- Меню «Поставить напоминание» ---
 def add_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="Добавить по времени", callback_data="add_time")
