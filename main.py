@@ -6,7 +6,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-TOKEN = "8532049702:AAFpukca2vnRYZDNpzOlssqTNge7RsMAR_I"
+TOKEN = ""
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -15,6 +15,36 @@ reminders = []
 user_stats = {}
 reminder_history = {}
 user_temp = {}
+
+user_lang = {}
+
+languages = {
+    "ru": {
+        "start": "Привет! Выбери раздел:",
+        "menu_add": "Поставить напоминание",
+        "menu_list": "Список напоминаний",
+        "menu_lang": "Язык",
+        "lang_set": "Язык установлен: Русский"
+    },
+    "en": {
+        "start": "Hi! Choose a section:",
+        "menu_add": "Set reminder",
+        "menu_list": "Reminders list",
+        "menu_lang": "Language",
+        "lang_set": "Language set: English"
+    },
+    "uz": {
+        "start": "Salom! Bo'limni tanlang:",
+        "menu_add": "Eslatma qo'shish",
+        "menu_list": "Eslatmalar ro'yxati",
+        "menu_lang": "Til",
+        "lang_set": "Til o'rnatildi: O'zbekcha"
+    }
+}
+
+def t(user_id, key):
+    lang = user_lang.get(user_id, "ru")
+    return languages.get(lang, languages["ru"]).get(key, key)
 
 async def reminder_trigger(user_id: int, time: datetime):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -97,6 +127,16 @@ async def back_to_main(cb: types.CallbackQuery):
     await cb.message.edit_text(
         "Главное меню:",
         reply_markup=main_menu()
+    )
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("lang_"))
+async def set_lang(cb: types.CallbackQuery):
+    code = cb.data.split("_", 1)[1]
+    user_lang[cb.from_user.id] = code
+    await cb.message.edit_text(
+        languages[code]["lang_set"],
+        reply_markup=main_menu_kb(cb.from_user.id)
     )
     await cb.answer()
 
