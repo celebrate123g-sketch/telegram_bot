@@ -1,10 +1,13 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
 
 TOKEN = " "
 
@@ -17,6 +20,10 @@ user_stats = {}
 reminder_history = {}
 user_temp = {}
 user_lang = {}
+engine = create_engine("sqlite:///reminders.db", echo=False)
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine)
+session = SessionLocal()
 
 languages = {
     "ru": {
@@ -41,6 +48,20 @@ languages = {
         "lang_set": "Til o'rnatildi: O'zbekcha"
     }
 }
+
+class ReminderStat(Base):
+    __tablename__ = "reminder_stats"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    text = Column(String)
+    time = Column(String)
+    type = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    triggered_at = Column(DateTime, nullable=True)
+
+def init_db():
+    Base.metadata.create_all(engine)
 
 def t(user_id, key):
     lang = user_lang.get(user_id, "ru")
@@ -88,6 +109,20 @@ async def reminder_trigger(user_id: int, text: str, idx: int):
         ]
     )
     await bot.send_message(user_id, f"Напоминание: {text}", reply_markup=kb)
+
+class ReminderStat(Base):
+    __tablename__ = "reminder_stats"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    text = Column(String)
+    time = Column(String)
+    type = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    triggered_at = Column(DateTime, nullable=True)
+
+def init_db():
+    Base.metadata.create_all(engine)
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -304,39 +339,44 @@ async def catch_edit(msg: types.Message):
     if temp["mode"] == "time":
         try:
             datetime.strptime(msg.text, "%H:%M")
-        except:
-            return await msg.reply("Неверный формат времени")
-
+        except ValueError:
+            await msg.reply("Неверный формат времени")
+            return
         job = reminders[idx].get("job")
         if job:
             try:
                 job.remove()
-            except:
+            except (AttributeError, RuntimeError):
                 pass
-
         reminders[idx]["time"] = msg.text
-
+        tm = datetime.strptime(msg.text, "%H:%M").time()
         if reminders[idx]["type"] == "once":
             now = datetime.now()
-            tm = datetime.strptime(msg.text, "%H:%M").time()
             dt = datetime.combine(now.date(), tm)
             if dt <= now:
                 dt += timedelta(days=1)
-            job = sched.add_job(reminder_trigger, "date", run_date=dt, args=[reminders[idx]["user_id"], reminders[idx]["text"], idx])
+            job = sched.add_job(
+                reminder_trigger,
+                "date",
+                run_date=dt,
+                args=[reminders[idx]["user_id"], reminders[idx]["text"], idx]
+            )
             reminders[idx]["job"] = job
-
         elif reminders[idx]["type"] == "daily":
-            tm = datetime.strptime(msg.text, "%H:%M").time()
-            job = sched.add_job(reminder_trigger, "cron", hour=tm.hour, minute=tm.minute, args=[reminders[idx]["user_id"], reminders[idx]["text"], idx])
+            job = sched.add_job(
+                reminder_trigger,
+                "cron",
+                hour=tm.hour,
+                minute=tm.minute,
+                args=[reminders[idx]["user_id"], reminders[idx]["text"], idx]
+            )
             reminders[idx]["job"] = job
-
         await msg.reply("Время изменено")
-        del user_temp[user_id]
-
+        user_temp.pop(user_id, None)
     elif temp["mode"] == "text":
         reminders[idx]["text"] = msg.text
         await msg.reply("Текст напоминания обновлён")
-        del user_temp[user_id]
+        user_temp.pop(user_id, None)
 
 @dp.callback_query(lambda c: c.data.startswith("del|"))
 async def delete_cb(cb: CallbackQuery):
