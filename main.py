@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
-TOKEN = " "
+TOKEN = ""
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -101,14 +101,22 @@ def lang_kb():
     kb.adjust(1)
     return kb.as_markup()
 
-async def reminder_trigger(user_id: int, text: str, idx: int):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнено", callback_data=f"done|{idx}")],
-            [InlineKeyboardButton(text="Не выполнено", callback_data=f"missed|{idx}")]
-        ]
-    )
-    await bot.send_message(user_id, f"Напоминание: {text}", reply_markup=kb)
+async def reminder_trigger(user_id, text, idx):
+    await bot.send_message(user_id, f"Напоминание: {text}")
+    session = SessionLocal()
+    try:
+        stat = session.query(ReminderStat).filter_by(
+            user_id=user_id,
+            text=text
+        ).order_by(ReminderStat.id.desc()).first()
+
+        if stat:
+            from datetime import datetime
+            stat.triggered_at = datetime.utcnow()
+            session.commit()
+
+    finally:
+        session.close()
 
 class ReminderStat(Base):
     __tablename__ = "reminder_stats"
@@ -163,13 +171,21 @@ async def open_list(cb: CallbackQuery):
     await cb.message.edit_text("Твои напоминания:\n\n" + text, reply_markup=kb.as_markup())
     await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "menu_stats")
-async def show_stats(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    stats = user_stats.get(user_id, {"created":0, "completed":0, "deleted":0})
-    txt = f"Статистика:\nСоздано: {stats['created']}\nВыполнено: {stats['completed']}\nУдалено: {stats['deleted']}"
-    await cb.message.edit_text(txt, reply_markup=back_kb())
-    await cb.answer()
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: types.Message):
+    session = SessionLocal()
+    rows = session.query(ReminderStat).filter_by(user_id=message.from_user.id).all()
+    session.close()
+    if not rows:
+        return await message.reply("У тебя пока нет статистики.")
+    text = "Твоя статистика напоминаний:\n\n"
+    for r in rows:
+        text += f"- {r.text} ({r.type}) — создано: {r.created_at}"
+        if r.triggered_at:
+            text += f", сработало: {r.triggered_at}"
+        text += "\n"
+    await message.reply(text)
 
 @dp.callback_query(lambda c: c.data == "menu_history")
 async def open_history(cb: CallbackQuery):
