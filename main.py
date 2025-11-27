@@ -48,6 +48,13 @@ languages = {
         "lang_set": "Til o'rnatildi: O'zbekcha"
     }
 }
+CATEGORIES = [
+    "Учеба",
+    "Спорт",
+    "Здоровье",
+    "Дом",
+    "Работа"
+]
 
 class ReminderStat(Base):
     __tablename__ = "reminder_stats"
@@ -246,21 +253,16 @@ async def cmd_atd(message: types.Message):
     parts = message.text.split(" ",2)
     if len(parts) < 3:
         return await message.reply("Используй формат: /atd HH:MM текст")
-
     time_str, text = parts[1], parts[2]
-
     try:
         tm = datetime.strptime(time_str, "%H:%M").time()
     except:
         return await message.reply("Неверный формат времени")
-
     idx = len(reminders)
     job = sched.add_job(reminder_trigger, "cron", hour=tm.hour, minute=tm.minute, args=[message.chat.id, text, idx])
     reminders.append({"user_id": message.chat.id, "type":"daily", "time": time_str, "text": text, "job": job})
-
     user_stats.setdefault(message.chat.id, {"created":0,"completed":0,"deleted":0})
     user_stats[message.chat.id]["created"] += 1
-
     await message.reply(f"Ежедневное напоминание установлено на {time_str}: {text}")
 
 @dp.message(Command("on"))
@@ -328,6 +330,29 @@ async def edit_choice(cb: CallbackQuery):
 
     await cb.message.edit_text("Что изменить?", reply_markup=kb.as_markup())
     await cb.answer()
+
+@dp.message_handler(lambda m: m.from_user.id in user_temp and user_temp[m.from_user.id]["step"] == "category")
+async def get_category(msg: types.Message):
+    user_id = msg.from_user.id
+    cat = msg.text
+
+    if cat not in CATEGORIES:
+        return await msg.reply("Выберите категорию из списка")
+
+    user_temp[user_id]["category"] = cat
+    user_temp[user_id]["step"] = "text"
+
+    await msg.reply("Введите текст напоминания", reply_markup=types.ReplyKeyboardRemove())
+
+@dp.message_handler(lambda m: m.from_user.id in user_temp and user_temp[m.from_user.id]["step"] == "text")
+async def get_text(msg: types.Message):
+    user_id = msg.from_user.id
+    text = msg.text
+
+    user_temp[user_id]["text"] = text
+    user_temp[user_id]["step"] = "time"
+
+    await msg.reply("Введите время (формат ЧЧ:ММ)")
 
 @dp.callback_query(lambda c: c.data.startswith("edit_time|"))
 async def ask_new_time(cb: CallbackQuery):
@@ -416,6 +441,18 @@ async def delete_cb(cb: CallbackQuery):
 
     await cb.message.edit_text("Напоминание удалено", reply_markup=back_kb())
     await cb.answer()
+
+@dp.message_handler(commands=["add"])
+async def add_cmd(msg: types.Message):
+    user_id = msg.from_user.id
+    user_temp[user_id] = {"step": "category"}
+
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for c in CATEGORIES:
+        kb.add(c)
+
+    await msg.reply("Выберите категорию", reply_markup=kb)
+
 
 @dp.message(Command("history"))
 async def history_cmd(message: types.Message):
