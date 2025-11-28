@@ -178,6 +178,49 @@ async def open_list(cb: CallbackQuery):
     await cb.message.edit_text("Твои напоминания:\n\n" + text, reply_markup=kb.as_markup())
     await cb.answer()
 
+@dp.callback_query(lambda c: c.data.startswith("edit_cat"))
+async def pick_new_category(cb: CallbackQuery):
+    idx = int(cb.data.split("|")[1])
+    user_id = cb.from_user.id
+
+    if idx not in reminders:
+        return await cb.message.reply("Напоминания не существует")
+
+    user_temp[user_id] = {
+        "mode": "change_category",
+        "index": idx
+    }
+
+    kb = InlineKeyboardBuilder()
+    for c in CATEGORIES:
+        kb.button(text=c, callback_data=f"new_cat|{c}")
+    kb.adjust(1)
+
+    await cb.message.edit_text(
+        f"Текущая категория: {reminders[idx]['category']}\nВыберите новую:",
+        reply_markup=kb.as_markup()
+    )
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("new_cat"))
+async def set_new_category(cb: CallbackQuery):
+    user_id = cb.from_user.id
+
+    if user_id not in user_temp:
+        return await cb.answer()
+
+    temp = user_temp[user_id]
+    idx = temp["index"]
+    new_category = cb.data.split("|")[1]
+
+    reminders[idx]["category"] = new_category
+
+    del user_temp[user_id]
+
+    await cb.message.edit_text(
+        f"Категория изменена на: {new_category}"
+    )
+    await cb.answer()
 
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
