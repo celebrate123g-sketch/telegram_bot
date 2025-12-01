@@ -62,6 +62,17 @@ class ReminderStat(Base):
 
 Base.metadata.create_all(engine)
 
+class Reminder(Base):
+    __tablename__ = "reminders"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    text = Column(String)
+    datetime = Column(DateTime)
+    type = Column(String)
+    category = Column(String, default="default")
+
+
 def t(user_id, key):
     lang = user_lang.get(user_id, "ru")
     return languages.get(lang, languages["ru"]).get(key, key)
@@ -73,6 +84,7 @@ def main_menu():
     kb.button(text="Статистика", callback_data="menu_stats")
     kb.button(text="История", callback_data="menu_history")
     kb.button(text="Язык", callback_data="menu_lang")
+    kb.button(text="По дате", callback_data="menu_date")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -124,6 +136,39 @@ async def set_lang(cb: CallbackQuery):
     code = cb.data.split("_")[1]
     user_lang[cb.from_user.id] = code
     await cb.message.edit_text(languages[code]["lang_set"], reply_markup=main_menu())
+    await cb.answer()
+
+def date_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Сегодня", callback_data="date_today")
+    kb.button(text="Завтра", callback_data="date_tomorrow")
+    kb.button(text="Выбрать дату", callback_data="date_pick")
+    kb.button(text="Все", callback_data="date_all")
+    kb.button(text="Назад", callback_data="go_back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+@dp.callback_query(lambda c: c.data == "date_today")
+async def today_reminders(cb: CallbackQuery):
+    session = SessionLocal()
+    user_id = cb.from_user.id
+    today = datetime.now().date()
+
+    items = session.query(Reminder).filter(
+        Reminder.user_id == user_id,
+        Reminder.datetime >= datetime.combine(today, datetime.min.time()),
+        Reminder.datetime <= datetime.combine(today, datetime.max.time())
+    ).all()
+    session.close()
+
+    if not items:
+        return await cb.message.edit_text("На сегодня нет напоминаний.", reply_markup=back_kb())
+
+    text = "Напоминания на сегодня:\n\n"
+    for r in items:
+        text += f"- {r.datetime.strftime('%H:%M')} — {r.text}\n"
+
+    await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
 @dp.message(Command("at"))
