@@ -171,6 +171,35 @@ async def today_reminders(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
+@dp.callback_query(lambda c: c.data == "date_tomorrow")
+async def tomorrow_reminders(cb: CallbackQuery):
+    session = SessionLocal()
+    user_id = cb.from_user.id
+    tomorrow = (datetime.now() + timedelta(days=1)).date()
+
+    items = session.query(Reminder).filter(
+        Reminder.user_id == user_id,
+        Reminder.datetime >= datetime.combine(tomorrow, datetime.min.time()),
+        Reminder.datetime <= datetime.combine(tomorrow, datetime.max.time())
+    ).all()
+    session.close()
+
+    if not items:
+        return await cb.message.edit_text("На завтра нет напоминаний.", reply_markup=back_kb())
+
+    text = "Напоминания на завтра:\n\n"
+    for r in items:
+        text += f"- {r.datetime.strftime('%H:%M')} — {r.text}\n"
+
+    await cb.message.edit_text(text, reply_markup=back_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "date_pick")
+async def pick_date(cb: CallbackQuery):
+    user_temp[cb.from_user.id] = {"mode": "pick_date"}
+    await cb.message.edit_text("Введи дату в формате YYYY-MM-DD:", reply_markup=back_kb())
+    await cb.answer()
+
 @dp.message(Command("at"))
 async def cmd_at(message: types.Message):
     parts = message.text.split(" ", 2)
@@ -279,35 +308,72 @@ async def edit_text(cb: CallbackQuery):
 
 @dp.message()
 async def edit_handler(msg: types.Message):
-    uid = msg.from_user.id
-    if uid not in user_temp:
+    user_id = msg.from_user.id
+    if user_id not in user_temp:
         return
-    data = user_temp[uid]
-    idx = data["index"]
-    if data["mode"] == "time":
+
+    temp = user_temp[user_id]
+    idx = temp.get("index")
+
+    if idx is None or idx >= len(reminders):
+        await msg.reply("Ошибка: напоминание не найдено")
+        user_temp.pop(user_id, None)
+        return
+    reminder = reminders[idx]
+    if temp.get("mode") == "time":
+        text_time = msg.text.strip()
         try:
-            tm = datetime.strptime(msg.text, "%H:%M").time()
-        except:
-            return await msg.reply("Неверный формат времени")
-        job = reminders[idx]["job"]
+            parsed_time = datetime.strptime(text_time, "%H:%M").time()
+        except ValueError:
+            await msg.reply("Неверный формат времени. Используй ЧЧ:ММ")
+            return
+        job = reminder.get("job")
         if job:
-            job.remove()
-        if reminders[idx]["type"] == "daily":
-            job = sched.add_job(reminder_trigger, "cron", hour=tm.hour, minute=tm.minute, args=[uid, reminders[idx]["text"], idx])
-        else:
+            try:
+                job.remove()
+            except Exception:
+                pass
+        reminder["time"] = text_time
+        if reminder.get("type") == "once":
             now = datetime.now()
-            dt = datetime.combine(now.date(), tm)
+            dt = datetime.combine(now.date(), parsed_time)
             if dt <= now:
                 dt += timedelta(days=1)
-            job = sched.add_job(reminder_trigger, "date", run_date=dt, args=[uid, reminders[idx]["text"], idx])
-        reminders[idx]["time"] = msg.text
-        reminders[idx]["job"] = job
-        user_temp.pop(uid)
-        await msg.reply("Время обновлено")
-    elif data["mode"] == "text":
-        reminders[idx]["text"] = msg.text
-        user_temp.pop(uid)
-        await msg.reply("Текст обновлён")
+            job = sched.add_job(
+                reminder_trigger,
+                "date",
+                run_date=dt,
+                args=[reminder.get("user_id"), reminder.get("text"), idx]
+            )
+            reminder["job"] = job
+        elif reminder.get("type") == "daily":
+            job = sched.add_job(
+                reminder_trigger,
+                "cron",
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                args=[reminder.get("user_id"), reminder.get("text"), idx]
+            )
+            reminder["job"] = job
+
+        await msg.reply("Время изменено")
+        user_temp.pop(user_id, None)
+        return
+    if temp.get("mode") == "text":
+        reminder["text"] = msg.text
+        await msg.reply("Текст напоминания обновлён")
+        user_temp.pop(user_id, None)
+        return
+    if temp.get("mode") == "pick_date":
+        try:
+            selected_date = datetime.strptime(msg.text, "%Y-%m-%d").date()
+        except ValueError:
+            await msg.reply("Неверный формат даты. Пример: 2025-02-14")
+            return
+        reminder["date"] = str(selected_date)
+        await msg.reply("Дата изменена")
+        user_temp.pop(user_id, None)
+        return
 
 @dp.callback_query(lambda c: c.data.startswith("del|"))
 async def delete_rem(cb: CallbackQuery):
