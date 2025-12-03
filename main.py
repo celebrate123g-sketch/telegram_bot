@@ -7,6 +7,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
+from typing_extensions import overload
 
 TOKEN = ""
 
@@ -306,15 +307,26 @@ async def edit_text(cb: CallbackQuery):
     await cb.message.edit_text("Введите новый текст", reply_markup=back_kb())
     await cb.answer()
 
+@dp.callback_query(lambda c: c.data.startswith("edit|"))
+async def edit_menu(cb: CallbackQuery):
+    idx = int(cb.data.split("|")[1])
+    user_temp[cb.from_user.id] = {"index": idx, "mode": None}
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Изменить время", callback_data=f"edit_time|{idx}")
+    kb.button(text="Изменить текст", callback_data=f"edit_text|{idx}")
+    kb.button(text="Изменить тип", callback_data=f"edit_type|{idx}")
+    kb.button(text="Назад", callback_data="go_back")
+    kb.adjust(1)
+    await cb.message.edit_text("Что изменить?", reply_markup=kb.as_markup())
+    await cb.answer()
+
 @dp.message()
 async def edit_handler(msg: types.Message):
     user_id = msg.from_user.id
     if user_id not in user_temp:
         return
-
     temp = user_temp[user_id]
     idx = temp.get("index")
-
     if idx is None or idx >= len(reminders):
         await msg.reply("Ошибка: напоминание не найдено")
         user_temp.pop(user_id, None)
@@ -355,7 +367,6 @@ async def edit_handler(msg: types.Message):
                 args=[reminder.get("user_id"), reminder.get("text"), idx]
             )
             reminder["job"] = job
-
         await msg.reply("Время изменено")
         user_temp.pop(user_id, None)
         return
@@ -385,6 +396,79 @@ async def delete_rem(cb: CallbackQuery):
             pass
     reminders[idx] = None
     await cb.message.edit_text("Удалено", reply_markup=back_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("edit_type|"))
+async def edit_type_choice(cb: CallbackQuery):
+    idx = int(cb.data.split("|")[1])
+    user_temp[cb.from_user.id] = {"index": idx, "mode": "type"}
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Разовое", callback_data=f"set_type_once|{idx}")
+    kb.button(text="Ежедневное", callback_data=f"set_type_daily|{idx}")
+    kb.button(text="Назад", callback_data="go_back")
+    kb.adjust(1)
+    await cb.message.edit_text("Выберите тип напоминания:", reply_markup=kb.as_markup())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("set_type_once|"))
+async def set_type_once(cb: CallbackQuery):
+    idx = int(cb.data.split("|")[1])
+    if idx < 0 or idx >= len(reminders) or reminders[idx] is None:
+        await cb.answer("Напоминание не найдено", show_alert=True)
+        return
+    r = reminders[idx]
+    old_job = r.get("job")
+    if old_job:
+        try:
+            old_job.remove()
+        except Exception:
+            pass
+    r["type"] = "once"
+    tstr = r.get("time", "")
+    dt = None
+    try:
+        if " " in tstr:
+            dt = datetime.strptime(tstr, "%Y-%m-%d %H:%M")
+        else:
+            tm = datetime.strptime(tstr, "%H:%M").time()
+            now = datetime.now()
+            dt = datetime.combine(now.date(), tm)
+            if dt <= now:
+                dt += timedelta(days=1)
+    except Exception:
+        now = datetime.now()
+        dt = now + timedelta(minutes=1)
+    job = sched.add_job(reminder_trigger, "date", run_date=dt, args=[r["user_id"], r["text"], idx])
+    r["job"] = job
+    await cb.message.edit_text("Тип изменён на: разовое", reply_markup=back_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("set_type_daily|"))
+async def set_type_daily(cb: CallbackQuery):
+    idx = int(cb.data.split("|")[1])
+    if idx < 0 or idx >= len(reminders) or reminders[idx] is None:
+        await cb.answer("Напоминание не найдено", show_alert=True)
+        return
+    r = reminders[idx]
+    old_job = r.get("job")
+    if old_job:
+        try:
+            old_job.remove()
+        except Exception:
+            pass
+    r["type"] = "daily"
+    tstr = r.get("time", "")
+    try:
+        if " " in tstr:
+            tpart = tstr.split(" ", 1)[1] if " " in tstr else tstr
+            tm = datetime.strptime(tpart, "%H:%M").time()
+        else:
+            tm = datetime.strptime(tstr, "%H:%M").time()
+    except Exception:
+        tm = (datetime.now() + timedelta(minutes=1)).time()
+    job = sched.add_job(reminder_trigger, "cron", hour=tm.hour, minute=tm.minute, args=[r["user_id"], r["text"], idx])
+    r["job"] = job
+    await cb.message.edit_text("Тип изменён на: ежедневное", reply_markup=back_kb())
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "menu_stats")
