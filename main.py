@@ -50,6 +50,7 @@ languages = {
 }
 
 CATEGORIES = ["Учеба", "Спорт", "Здоровье", "Дом", "Работа"]
+user_weekly = {}
 
 class ReminderStat(Base):
     __tablename__ = "reminder_stats"
@@ -77,6 +78,25 @@ class Reminder(Base):
 def t(user_id, key):
     lang = user_lang.get(user_id, "ru")
     return languages.get(lang, languages["ru"]).get(key, key)
+
+def week_keyboard(selected):
+    kb = InlineKeyboardBuilder()
+    days = [
+        ("Пн", "mon"),
+        ("Вт", "tue"),
+        ("Ср", "wed"),
+        ("Чт", "thu"),
+        ("Пт", "fri"),
+        ("Сб", "sat"),
+        ("Вс", "sun")
+    ]
+
+    for txt, code in days:
+        mark = "[X]" if code in selected else "[ ]"
+        kb.button(text=f"{txt} {mark}", callback_data=f"wd_{code}")
+    kb.button(text="Готово", callback_data="wd_done")
+    kb.adjust(3)
+    return kb.as_markup()
 
 def main_menu():
     kb = InlineKeyboardBuilder()
@@ -149,6 +169,12 @@ def date_menu():
     kb.adjust(1)
     return kb.as_markup()
 
+@dp.callback_query(lambda c: c.data == "weekly_start")
+async def weekly_start(cb: CallbackQuery):
+    user_weekly[cb.from_user.id] = {"days": []}
+    await cb.message.edit_text("Выбери дни недели:", reply_markup=week_keyboard([]))
+    await cb.answer()
+
 @dp.callback_query(lambda c: c.data == "date_today")
 async def today_reminders(cb: CallbackQuery):
     session = SessionLocal()
@@ -193,6 +219,36 @@ async def tomorrow_reminders(cb: CallbackQuery):
         text += f"- {r.datetime.strftime('%H:%M')} — {r.text}\n"
 
     await cb.message.edit_text(text, reply_markup=back_kb())
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("wd_") and c.data != "wd_done")
+async def toggle_day(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    day = cb.data[3:]
+    data = user_weekly.get(user_id)
+
+    if not data:
+        return await cb.answer()
+
+    if day in data["days"]:
+        data["days"].remove(day)
+    else:
+        data["days"].append(day)
+
+    await cb.message.edit_text("Выбери дни недели:", reply_markup=week_keyboard(data["days"]))
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "wd_done")
+async def weekly_done(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    data = user_weekly.get(user_id)
+
+    if not data or not data["days"]:
+        return await cb.answer("Выбери хотя бы один день!", show_alert=True)
+
+    user_weekly[user_id]["mode"] = "time"
+    await cb.message.edit_text("Введи время в формате ЧЧ:ММ")
+    await cb.answer()
     await cb.answer()
 
 @dp.callback_query(lambda c: c.data == "date_pick")
@@ -385,6 +441,29 @@ async def edit_handler(msg: types.Message):
         await msg.reply("Дата изменена")
         user_temp.pop(user_id, None)
         return
+    if msg.from_user.id in user_weekly:
+        data = user_weekly[msg.from_user.id]
+
+        if data.get("mode") == "time":
+            try:
+                tm = datetime.strptime(msg.text, "%H:%M").time()
+            except:
+                return await msg.reply("Неверный формат времени")
+
+            days = ",".join(data["days"])
+
+            job = sched.add_job(
+                reminder_trigger,
+                "cron",
+                day_of_week=days,
+                hour=tm.hour,
+                minute=tm.minute,
+                args=[msg.from_user.id, "Напоминание!", -1]
+            )
+
+            await msg.reply("Еженедельное напоминание создано.")
+            del user_weekly[msg.from_user.id]
+            return
 
 @dp.callback_query(lambda c: c.data.startswith("del|"))
 async def delete_rem(cb: CallbackQuery):
