@@ -53,6 +53,22 @@ def gemini_image_request(image_bytes: bytes, prompt: str) -> str:
         return response.text
     except Exception:
         return "Не удалось распознать изображение."
+        
+def gemini_video_request(video_bytes: bytes, prompt: str) -> str:
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=[
+                types.Part.from_bytes(
+                    data=video_bytes,
+                    mime_type="video/mp4"
+                ),
+                prompt
+            ]
+        )
+        return response.text
+    except Exception as e:
+        return "Не удалось проанализировать видео."
 
 @router.message(F.text)
 async def ai_answer(message: Message):
@@ -93,6 +109,32 @@ async def photo_handler(message: Message):
     answer = await asyncio.to_thread(
         gemini_image_request,
         image_bytes.read(),
+        prompt
+    )
+
+    await message.answer(answer)
+
+@router.message(F.content_type == ContentType.VIDEO)
+async def video_handler(message: Message):
+    await message.bot.send_chat_action(
+        chat_id=message.chat.id,
+        action="typing"
+    )
+
+    video = message.video
+
+    if video.file_size > 20 * 1024 * 1024:
+        await message.answer("Видео слишком большое (макс 20 МБ).")
+        return
+
+    file = await message.bot.get_file(video.file_id)
+    video_bytes = await message.bot.download_file(file.file_path)
+
+    prompt = "Опиши, что происходит в этом видео."
+
+    answer = await asyncio.to_thread(
+        gemini_video_request,
+        video_bytes.read(),
         prompt
     )
 
