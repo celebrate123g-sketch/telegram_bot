@@ -5,7 +5,8 @@ from aiogram.filters import CommandStart
 from google import genai
 from config import BOT_TOKEN, GEMINI_API_KEY
 from aiogram.enums import ChatAction
-
+from aiogram.types import ContentType
+from google.genai import types
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 router = Router()
@@ -28,16 +29,30 @@ async def gemini_request(prompt: str) -> str:
             model="gemini-1.5",
             input=prompt
         )
-        # текст из первого candidate
         if response.candidates and len(response.candidates) > 0:
             text_parts = response.candidates[0].content
-            # content это список частей с типом 'output_text'
             for part in text_parts:
                 if part.type == "output_text":
                     return part.text
         return "Gemini не вернул ответ."
     except Exception as e:
         return f"Gemini не вернул ответ. Ошибка: {e}"
+
+def gemini_image_request(image_bytes: bytes, prompt: str) -> str:
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=[
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg"
+                ),
+                prompt
+            ]
+        )
+        return response.text
+    except Exception:
+        return "Не удалось распознать изображение."
 
 @router.message(F.text)
 async def ai_answer(message: Message):
@@ -60,6 +75,27 @@ async def ai_answer(message: Message):
     answer = await asyncio.to_thread(gemini_request, context)
 
     history[user_id].append(f"Бот: {answer}")
+    await message.answer(answer)
+
+@router.message(F.content_type == ContentType.PHOTO)
+async def photo_handler(message: Message):
+    await message.bot.send_chat_action(
+        chat_id=message.chat.id,
+        action="typing"
+    )
+
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    image_bytes = await message.bot.download_file(file.file_path)
+
+    prompt = "Опиши подробно, что изображено на этом фото."
+
+    answer = await asyncio.to_thread(
+        gemini_image_request,
+        image_bytes.read(),
+        prompt
+    )
+
     await message.answer(answer)
 
 @router.message(F.text == "/clear")
