@@ -1,6 +1,8 @@
 import asyncio
 import io
 import logging
+import tempfile
+import os
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -11,6 +13,7 @@ from google import genai
 from google.genai import types
 
 import pdfplumber
+import whisper
 
 from config import BOT_TOKEN, GEMINI_API_KEY
 
@@ -22,11 +25,13 @@ router = Router()
 dp.include_router(router)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+whisper_model = whisper.load_model("base")
 
 MAX_HISTORY = 10
 
 history = {}
 user_mode = {}
+last_answer = {}
 
 DEFAULT_PROMPT = "Ты Telegram-бот на Gemini AI. Отвечай кратко и понятно на русском языке."
 
@@ -45,6 +50,13 @@ settings_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="💬 Обычный", callback_data="mode_chat")],
     [InlineKeyboardButton(text="💻 Программирование", callback_data="mode_code")],
     [InlineKeyboardButton(text="📚 Учёба", callback_data="mode_study")]
+])
+
+answer_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✏ Упростить", callback_data="simplify")],
+    [InlineKeyboardButton(text="🧠 Исправить", callback_data="fix")],
+    [InlineKeyboardButton(text="➡ Продолжить", callback_data="continue")],
+    [InlineKeyboardButton(text="🌍 Перевести", callback_data="translate")]
 ])
 
 async def gemini_text_request(contents: list) -> str:
@@ -93,9 +105,8 @@ def gemini_video_request(video_bytes: bytes, prompt: str) -> str:
 async def start(message: Message):
     history[message.from_user.id] = []
     user_mode[message.from_user.id] = "chat"
-    name = message.from_user.first_name
     await message.answer(
-        f"Привет, {name}\nЯ бот на Gemini AI\nЗадай вопрос или отправь файл",
+        "Привет. Я бот на Gemini AI.\nМожешь писать, отправлять голос, фото, видео и документы.",
         reply_markup=main_keyboard
     )
 
@@ -114,7 +125,33 @@ async def set_mode(callback: CallbackQuery):
 @router.callback_query(F.data == "clear")
 async def clear_history(callback: CallbackQuery):
     history.pop(callback.from_user.id, None)
+    last_answer.pop(callback.from_user.id, None)
     await callback.message.answer("История очищена", reply_markup=main_keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data.in_({"simplify", "fix", "continue", "translate"}))
+async def answer_actions(callback: CallbackQuery):
+    text = last_answer.get(callback.from_user.id)
+    if not text:
+        await callback.answer("Нет ответа для обработки", show_alert=True)
+        return
+
+    prompts = {
+        "simplify": "Упрости этот текст:",
+        "fix": "Исправь ошибки и улучши текст:",
+        "continue": "Продолжи мысль:",
+        "translate": "Переведи этот текст на английский:"
+    }
+
+    contents = [
+        {"role": "system", "content": DEFAULT_PROMPT},
+        {"role": "user", "content": f"{prompts[callback.data]}\n{text}"}
+    ]
+
+    answer = await gemini_text_request(contents)
+    last_answer[callback.from_user.id] = answer
+
+    await callback.message.answer(answer, reply_markup=answer_keyboard)
     await callback.answer()
 
 @router.message(F.text)
@@ -124,10 +161,7 @@ async def text_handler(message: Message):
     user_id = message.from_user.id
     history.setdefault(user_id, [])
 
-    history[user_id].append({
-        "role": "user",
-        "content": message.text
-    })
+    history[user_id].append({"role": "user", "content": message.text})
 
     system_prompt = MODE_PROMPTS.get(user_mode.get(user_id, "chat"), DEFAULT_PROMPT)
 
@@ -136,74 +170,36 @@ async def text_handler(message: Message):
 
     answer = await gemini_text_request(contents)
 
-    history[user_id].append({
-        "role": "assistant",
-        "content": answer
-    })
+    history[user_id].append({"role": "assistant", "content": answer})
+    last_answer[user_id] = answer
 
-    await message.answer(answer, reply_markup=main_keyboard)
+    await message.answer(answer, reply_markup=answer_keyboard)
 
-@router.message(F.content_type == ContentType.PHOTO)
-async def photo_handler(message: Message):
+@router.message(F.voice)
+async def voice_handler(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    photo = message.photo[-1]
-    file = await message.bot.get_file(photo.file_id)
+    file = await message.bot.get_file(message.voice.file_id)
     data = await message.bot.download_file(file.file_path)
 
-    answer = await asyncio.to_thread(
-        gemini_image_request,
-        data.read(),
-        "Опиши подробно, что изображено на фото"
-    )
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
+        tmp.write(data.read())
+        tmp_path = tmp.name
 
-    await message.answer(answer, reply_markup=main_keyboard)
+    result = whisper_model.transcribe(tmp_path, language="ru")
+    os.remove(tmp_path)
 
-@router.message(F.content_type == ContentType.VIDEO)
-async def video_handler(message: Message):
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    if message.video.file_size > 20 * 1024 * 1024:
-        await message.answer("Видео слишком большое")
+    text = result["text"].strip()
+    if not text:
+        await message.answer("Не удалось распознать речь")
         return
 
-    file = await message.bot.get_file(message.video.file_id)
-    data = await message.bot.download_file(file.file_path)
-
-    answer = await asyncio.to_thread(
-        gemini_video_request,
-        data.read(),
-        "Опиши, что происходит в этом видео"
-    )
-
-    await message.answer(answer, reply_markup=main_keyboard)
-
-@router.message(F.document)
-async def document_handler(message: Message):
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    file = await message.bot.get_file(message.document.file_id)
-    data = await message.bot.download_file(file.file_path)
-
-    text = ""
-
-    if message.document.mime_type == "application/pdf":
-        with pdfplumber.open(io.BytesIO(data.read())) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-    else:
-        text = data.read().decode("utf-8", errors="ignore")
-
-    text = text[:15000]
-
-    contents = [
-        {"role": "system", "content": "Проанализируй документ и кратко объясни его содержание"},
-        {"role": "user", "content": text}
-    ]
-
-    answer = await gemini_text_request(contents)
-
-    await message.answer(answer, reply_markup=main_keyboard)
+    await text_handler(Message(
+        message_id=message.message_id,
+        from_user=message.from_user,
+        chat=message.chat,
+        text=text
+    ))
 
 async def main():
     await dp.start_polling(bot)
