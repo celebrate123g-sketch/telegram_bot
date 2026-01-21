@@ -3,6 +3,7 @@ import io
 import logging
 import tempfile
 import os
+import json
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -29,15 +30,24 @@ whisper_model = whisper.load_model("base")
 
 MAX_HISTORY = 10
 
-history = {}
-user_mode = {}
-last_answer = {}
+HISTORY_FILE = "bot_history.json"
+
+if os.path.exists(HISTORY_FILE):
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        saved_data = json.load(f)
+        history = saved_data.get("history", {})
+        user_mode = saved_data.get("user_mode", {})
+        last_answer = saved_data.get("last_answer", {})
+else:
+    history = {}
+    user_mode = {}
+    last_answer = {}
 
 DEFAULT_PROMPT = "Ты Telegram-бот на Gemini AI. Отвечай кратко и понятно на русском языке."
 
 MODE_PROMPTS = {
     "chat": DEFAULT_PROMPT,
-    "code": "Ты помощник-программист. Отвечай с примерами кода и объяснениями.",
+    "code": "Ты помощник-программист. Отвечай с примерами кода и краткими объяснениями.",
     "study": "Ты объясняешь как учитель — просто, по шагам, с примерами."
 }
 
@@ -59,6 +69,14 @@ answer_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🌍 Перевести", callback_data="translate")]
 ])
 
+def save_history():
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "history": history,
+            "user_mode": user_mode,
+            "last_answer": last_answer
+        }, f, ensure_ascii=False, indent=2)
+
 async def gemini_text_request(contents: list) -> str:
     try:
         response = await client.responses.acreate(
@@ -75,36 +93,10 @@ async def gemini_text_request(contents: list) -> str:
         logging.error(e)
         return "Ошибка при обращении к Gemini."
 
-def gemini_image_request(image_bytes: bytes, prompt: str) -> str:
-    try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                types.Part.from_bytes(image_bytes, mime_type="image/jpeg"),
-                prompt
-            ]
-        )
-        return response.text
-    except Exception:
-        return "Не удалось распознать изображение."
-
-def gemini_video_request(video_bytes: bytes, prompt: str) -> str:
-    try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                types.Part.from_bytes(video_bytes, mime_type="video/mp4"),
-                prompt
-            ]
-        )
-        return response.text
-    except Exception:
-        return "Не удалось проанализировать видео."
-
 @router.message(CommandStart())
 async def start(message: Message):
-    history[message.from_user.id] = []
-    user_mode[message.from_user.id] = "chat"
+    history.setdefault(message.from_user.id, [])
+    user_mode.setdefault(message.from_user.id, "chat")
     await message.answer(
         "Привет. Я бот на Gemini AI.\nМожешь писать, отправлять голос, фото, видео и документы.",
         reply_markup=main_keyboard
@@ -119,6 +111,7 @@ async def settings(callback: CallbackQuery):
 async def set_mode(callback: CallbackQuery):
     mode = callback.data.replace("mode_", "")
     user_mode[callback.from_user.id] = mode
+    save_history()
     await callback.message.answer(f"Режим установлен: {mode}", reply_markup=main_keyboard)
     await callback.answer()
 
@@ -126,6 +119,7 @@ async def set_mode(callback: CallbackQuery):
 async def clear_history(callback: CallbackQuery):
     history.pop(callback.from_user.id, None)
     last_answer.pop(callback.from_user.id, None)
+    save_history()
     await callback.message.answer("История очищена", reply_markup=main_keyboard)
     await callback.answer()
 
@@ -150,6 +144,7 @@ async def answer_actions(callback: CallbackQuery):
 
     answer = await gemini_text_request(contents)
     last_answer[callback.from_user.id] = answer
+    save_history()
 
     await callback.message.answer(answer, reply_markup=answer_keyboard)
     await callback.answer()
@@ -172,6 +167,7 @@ async def text_handler(message: Message):
 
     history[user_id].append({"role": "assistant", "content": answer})
     last_answer[user_id] = answer
+    save_history()
 
     await message.answer(answer, reply_markup=answer_keyboard)
 
@@ -200,6 +196,34 @@ async def voice_handler(message: Message):
         chat=message.chat,
         text=text
     ))
+
+@router.message(F.content_type == ContentType.DOCUMENT)
+async def document_handler(message: Message):
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    file = await message.bot.get_file(message.document.file_id)
+    data = await message.bot.download_file(file.file_path)
+
+    text = ""
+    if message.document.mime_type == "application/pdf":
+        with pdfplumber.open(io.BytesIO(data.read())) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+    else:
+        text = data.read().decode("utf-8", errors="ignore")
+
+    text = text[:15000]
+
+    contents = [
+        {"role": "system", "content": "Кратко объясни содержание документа"},
+        {"role": "user", "content": text}
+    ]
+
+    answer = await gemini_text_request(contents)
+    last_answer[message.from_user.id] = answer
+    save_history()
+
+    await message.answer(answer, reply_markup=answer_keyboard)
 
 async def main():
     await dp.start_polling(bot)
