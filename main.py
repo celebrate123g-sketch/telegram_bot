@@ -1,8 +1,6 @@
 import asyncio
 import io
 import logging
-import tempfile
-import os
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -13,7 +11,6 @@ from google import genai
 from google.genai import types
 
 import pdfplumber
-import whisper
 
 from config import BOT_TOKEN, GEMINI_API_KEY
 
@@ -25,7 +22,14 @@ router = Router()
 dp.include_router(router)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-whisper_model = whisper.load_model("base")
+
+DEFAULT_PROMPT = "Ты Telegram-бот на Gemini AI. Отвечай кратко и понятно на русском языке."
+
+MODE_PROMPTS = {
+    "chat": DEFAULT_PROMPT,
+    "code": "Ты помощник-программист. Отвечай с примерами кода и краткими объяснениями.",
+    "study": "Ты объясняешь как учитель — просто, по шагам, с примерами."
+}
 
 MAX_HISTORY = 10
 
@@ -33,80 +37,52 @@ history = {}
 user_mode = {}
 last_answer = {}
 
-DEFAULT_PROMPT = "Ты Telegram-бот на Gemini AI. Отвечай кратко и понятно на русском языке."
-
-MODE_PROMPTS = {
-    "chat": DEFAULT_PROMPT,
-    "code": "Ты помощник-программист. Отвечай с примерами кода и объяснениями.",
-    "study": "Ты объясняешь как учитель — просто, по шагам, с примерами."
-}
-
 main_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="⚙ Режим", callback_data="settings")],
-    [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="clear")]
+    [InlineKeyboardButton(text="Режим", callback_data="settings")],
+    [InlineKeyboardButton(text="Очистить историю", callback_data="clear")]
 ])
 
 settings_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💬 Обычный", callback_data="mode_chat")],
-    [InlineKeyboardButton(text="💻 Программирование", callback_data="mode_code")],
-    [InlineKeyboardButton(text="📚 Учёба", callback_data="mode_study")]
+    [InlineKeyboardButton(text="Обычный", callback_data="mode_chat")],
+    [InlineKeyboardButton(text="Программирование", callback_data="mode_code")],
+    [InlineKeyboardButton(text="Учёба", callback_data="mode_study")]
 ])
 
 answer_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="✏ Упростить", callback_data="simplify")],
-    [InlineKeyboardButton(text="🧠 Исправить", callback_data="fix")],
-    [InlineKeyboardButton(text="➡ Продолжить", callback_data="continue")],
-    [InlineKeyboardButton(text="🌍 Перевести", callback_data="translate")]
+    [InlineKeyboardButton(text="Упростить", callback_data="simplify")],
+    [InlineKeyboardButton(text="Исправить", callback_data="fix")],
+    [InlineKeyboardButton(text="Продолжить", callback_data="continue")],
+    [InlineKeyboardButton(text="Перевести", callback_data="translate")]
 ])
 
-async def gemini_text_request(contents: list) -> str:
+async def gemini_text_request(messages):
     try:
-        response = await client.responses.acreate(
-            model="gemini-1.5",
-            input=contents
+        contents = []
+
+        for msg in messages:
+            contents.append(
+                types.Content(
+                    role=msg["role"],
+                    parts=[types.Part(text=msg["content"])]
+                )
+            )
+
+        response = client.models.generate_content(
+            model="gemini-1.5-pro",
+            contents=contents
         )
-        for item in response.output:
-            if item["type"] == "message":
-                for part in item["content"]:
-                    if part["type"] == "output_text":
-                        return part["text"]
-        return "Gemini не вернул ответ."
+
+        return response.text.strip()
     except Exception as e:
         logging.error(e)
-        return "Ошибка при обращении к Gemini."
-
-def gemini_image_request(image_bytes: bytes, prompt: str) -> str:
-    try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                types.Part.from_bytes(image_bytes, mime_type="image/jpeg"),
-                prompt
-            ]
-        )
-        return response.text
-    except Exception:
-        return "Не удалось распознать изображение."
-
-def gemini_video_request(video_bytes: bytes, prompt: str) -> str:
-    try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                types.Part.from_bytes(video_bytes, mime_type="video/mp4"),
-                prompt
-            ]
-        )
-        return response.text
-    except Exception:
-        return "Не удалось проанализировать видео."
+        return "Ошибка при обращении к Gemini"
 
 @router.message(CommandStart())
 async def start(message: Message):
     history[message.from_user.id] = []
     user_mode[message.from_user.id] = "chat"
     await message.answer(
-        "Привет. Я бот на Gemini AI.\nМожешь писать, отправлять голос, фото, видео и документы.",
+        "Привет. Я бот на Gemini AI.\nПиши текст или отправляй документы.",
         reply_markup=main_keyboard
     )
 
@@ -143,12 +119,12 @@ async def answer_actions(callback: CallbackQuery):
         "translate": "Переведи этот текст на английский:"
     }
 
-    contents = [
+    messages = [
         {"role": "system", "content": DEFAULT_PROMPT},
-        {"role": "user", "content": f"{prompts[callback.data]}\n{text}"}
+        {"role": "user", "content": prompts[callback.data] + "\n" + text}
     ]
 
-    answer = await gemini_text_request(contents)
+    answer = await gemini_text_request(messages)
     last_answer[callback.from_user.id] = answer
 
     await callback.message.answer(answer, reply_markup=answer_keyboard)
@@ -165,41 +141,43 @@ async def text_handler(message: Message):
 
     system_prompt = MODE_PROMPTS.get(user_mode.get(user_id, "chat"), DEFAULT_PROMPT)
 
-    contents = [{"role": "system", "content": system_prompt}]
-    contents.extend(history[user_id][-MAX_HISTORY:])
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history[user_id][-MAX_HISTORY:])
 
-    answer = await gemini_text_request(contents)
+    answer = await gemini_text_request(messages)
 
     history[user_id].append({"role": "assistant", "content": answer})
     last_answer[user_id] = answer
 
     await message.answer(answer, reply_markup=answer_keyboard)
 
-@router.message(F.voice)
-async def voice_handler(message: Message):
+@router.message(F.content_type == ContentType.DOCUMENT)
+async def document_handler(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    file = await message.bot.get_file(message.voice.file_id)
+    file = await message.bot.get_file(message.document.file_id)
     data = await message.bot.download_file(file.file_path)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
-        tmp.write(data.read())
-        tmp_path = tmp.name
+    text = ""
 
-    result = whisper_model.transcribe(tmp_path, language="ru")
-    os.remove(tmp_path)
+    if message.document.mime_type == "application/pdf":
+        with pdfplumber.open(io.BytesIO(data.read())) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+    else:
+        text = data.read().decode("utf-8", errors="ignore")
 
-    text = result["text"].strip()
-    if not text:
-        await message.answer("Не удалось распознать речь")
-        return
+    text = text[:15000]
 
-    await text_handler(Message(
-        message_id=message.message_id,
-        from_user=message.from_user,
-        chat=message.chat,
-        text=text
-    ))
+    messages = [
+        {"role": "system", "content": "Кратко объясни содержание документа"},
+        {"role": "user", "content": text}
+    ]
+
+    answer = await gemini_text_request(messages)
+    last_answer[message.from_user.id] = answer
+
+    await message.answer(answer, reply_markup=answer_keyboard)
 
 async def main():
     await dp.start_polling(bot)
