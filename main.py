@@ -1,20 +1,19 @@
 import asyncio
 import io
-import logging
-import tempfile
-import os
 import json
+import logging
+import os
+import tempfile
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
 from aiogram.filters import CommandStart
 from aiogram.enums import ChatAction, ContentType
 
 from google import genai
-from google.genai import types
-
+from faster_whisper import WhisperModel
+from gtts import gTTS
 import pdfplumber
-import whisper
 
 from config import BOT_TOKEN, GEMINI_API_KEY
 
@@ -26,148 +25,183 @@ router = Router()
 dp.include_router(router)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-whisper_model = whisper.load_model("base")
+
+whisper_model = WhisperModel(
+    "base",
+    device="cpu",
+    compute_type="int8"
+)
 
 MAX_HISTORY = 10
+DATA_FILE = "bot_data.json"
 
-HISTORY_FILE = "bot_history.json"
-
-if os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        saved_data = json.load(f)
-        history = saved_data.get("history", {})
-        user_mode = saved_data.get("user_mode", {})
-        last_answer = saved_data.get("last_answer", {})
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
 else:
-    history = {}
-    user_mode = {}
-    last_answer = {}
+    data = {}
 
-DEFAULT_PROMPT = "Ты Telegram-бот на Gemini AI. Отвечай кратко и понятно на русском языке."
+history = data.get("history", {})
+user_settings = data.get("user_settings", {})
+last_answer = data.get("last_answer", {})
+last_prompt = data.get("last_prompt", {})
 
-MODE_PROMPTS = {
-    "chat": DEFAULT_PROMPT,
-    "code": "Ты помощник-программист. Отвечай с примерами кода и краткими объяснениями.",
-    "study": "Ты объясняешь как учитель — просто, по шагам, с примерами."
-}
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "history": history,
+                "user_settings": user_settings,
+                "last_answer": last_answer,
+                "last_prompt": last_prompt
+            },
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+def build_system_prompt(user_id: int) -> str:
+    settings = user_settings.get(user_id, {})
+    lang = settings.get("lang", "ru")
+    verbose = settings.get("verbose", "short")
+
+    prompt = "Ты полезный Telegram-бот на Gemini AI."
+
+    if lang == "ru":
+        prompt += " Отвечай на русском языке."
+    else:
+        prompt += " Answer in English."
+
+    if verbose == "short":
+        prompt += " Кратко и по делу."
+    else:
+        prompt += " Подробно, с объяснениями."
+
+    return prompt
+
+async def gemini_request(messages: list[str]) -> str:
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=messages
+        )
+        return response.text.strip()
+    except Exception:
+        logging.exception("Gemini error")
+        return "❌ Ошибка при обращении к Gemini."
 
 main_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="⚙ Режим", callback_data="settings")],
+    [InlineKeyboardButton(text="⚙ Настройки", callback_data="settings")],
     [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="clear")]
 ])
 
 settings_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💬 Обычный", callback_data="mode_chat")],
-    [InlineKeyboardButton(text="💻 Программирование", callback_data="mode_code")],
-    [InlineKeyboardButton(text="📚 Учёба", callback_data="mode_study")]
+    [
+        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
+        InlineKeyboardButton(text="🇺🇸 English", callback_data="lang_en")
+    ],
+    [
+        InlineKeyboardButton(text="✂ Кратко", callback_data="short"),
+        InlineKeyboardButton(text="📖 Подробно", callback_data="long")
+    ]
 ])
 
 answer_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="✏ Упростить", callback_data="simplify")],
-    [InlineKeyboardButton(text="🧠 Исправить", callback_data="fix")],
-    [InlineKeyboardButton(text="➡ Продолжить", callback_data="continue")],
-    [InlineKeyboardButton(text="🌍 Перевести", callback_data="translate")]
+    [InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")],
+    [InlineKeyboardButton(text="🔊 Ответить голосом", callback_data="voice")]
 ])
-
-def save_history():
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "history": history,
-            "user_mode": user_mode,
-            "last_answer": last_answer
-        }, f, ensure_ascii=False, indent=2)
-
-async def gemini_text_request(contents: list) -> str:
-    try:
-        response = await client.responses.acreate(
-            model="gemini-1.5",
-            input=contents
-        )
-        for item in response.output:
-            if item["type"] == "message":
-                for part in item["content"]:
-                    if part["type"] == "output_text":
-                        return part["text"]
-        return "Gemini не вернул ответ."
-    except Exception as e:
-        logging.error(e)
-        return "Ошибка при обращении к Gemini."
 
 @router.message(CommandStart())
 async def start(message: Message):
-    history.setdefault(message.from_user.id, [])
-    user_mode.setdefault(message.from_user.id, "chat")
+    uid = message.from_user.id
+    history.setdefault(uid, [])
+    user_settings.setdefault(uid, {"lang": "ru", "verbose": "short"})
     await message.answer(
-        "Привет. Я бот на Gemini AI.\nМожешь писать, отправлять голос, фото, видео и документы.",
+        "Привет! Я бот на Gemini AI.\nМожешь писать текстом или голосом 🎤",
         reply_markup=main_keyboard
     )
 
 @router.callback_query(F.data == "settings")
 async def settings(callback: CallbackQuery):
-    await callback.message.answer("Выбери режим:", reply_markup=settings_keyboard)
+    await callback.message.answer("Настройки:", reply_markup=settings_keyboard)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("mode_"))
-async def set_mode(callback: CallbackQuery):
-    mode = callback.data.replace("mode_", "")
-    user_mode[callback.from_user.id] = mode
-    save_history()
-    await callback.message.answer(f"Режим установлен: {mode}", reply_markup=main_keyboard)
+@router.callback_query(F.data.in_({"lang_ru", "lang_en", "short", "long"}))
+async def set_settings(callback: CallbackQuery):
+    uid = callback.from_user.id
+    user_settings.setdefault(uid, {})
+
+    if callback.data.startswith("lang"):
+        user_settings[uid]["lang"] = callback.data.split("_")[1]
+    else:
+        user_settings[uid]["verbose"] = callback.data
+
+    save_data()
+    await callback.message.answer("✅ Настройки сохранены", reply_markup=main_keyboard)
     await callback.answer()
 
 @router.callback_query(F.data == "clear")
-async def clear_history(callback: CallbackQuery):
-    history.pop(callback.from_user.id, None)
-    last_answer.pop(callback.from_user.id, None)
-    save_history()
-    await callback.message.answer("История очищена", reply_markup=main_keyboard)
+async def clear(callback: CallbackQuery):
+    uid = callback.from_user.id
+    history.pop(uid, None)
+    save_data()
+    await callback.message.answer("🧹 История очищена")
     await callback.answer()
 
-@router.callback_query(F.data.in_({"simplify", "fix", "continue", "translate"}))
-async def answer_actions(callback: CallbackQuery):
-    text = last_answer.get(callback.from_user.id)
-    if not text:
-        await callback.answer("Нет ответа для обработки", show_alert=True)
+@router.callback_query(F.data == "regen")
+async def regenerate(callback: CallbackQuery):
+    uid = callback.from_user.id
+    prompt = last_prompt.get(uid)
+
+    if not prompt:
+        await callback.answer("Нечего перегенерировать", show_alert=True)
         return
 
-    prompts = {
-        "simplify": "Упрости этот текст:",
-        "fix": "Исправь ошибки и улучши текст:",
-        "continue": "Продолжи мысль:",
-        "translate": "Переведи этот текст на английский:"
-    }
+    system = build_system_prompt(uid)
+    answer = await gemini_request([system, prompt])
 
-    contents = [
-        {"role": "system", "content": DEFAULT_PROMPT},
-        {"role": "user", "content": f"{prompts[callback.data]}\n{text}"}
-    ]
-
-    answer = await gemini_text_request(contents)
-    last_answer[callback.from_user.id] = answer
-    save_history()
+    last_answer[uid] = answer
+    save_data()
 
     await callback.message.answer(answer, reply_markup=answer_keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data == "voice")
+async def answer_voice(callback: CallbackQuery):
+    uid = callback.from_user.id
+    text = last_answer.get(uid)
+
+    if not text:
+        await callback.answer("Нет текста", show_alert=True)
+        return
+
+    tts = gTTS(text=text, lang=user_settings.get(uid, {}).get("lang", "ru"))
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+        tts.save(f.name)
+        audio = FSInputFile(f.name)
+
+    await callback.message.answer_voice(audio)
+    os.remove(f.name)
     await callback.answer()
 
 @router.message(F.text)
 async def text_handler(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    user_id = message.from_user.id
-    history.setdefault(user_id, [])
+    uid = message.from_user.id
+    history.setdefault(uid, [])
 
-    history[user_id].append({"role": "user", "content": message.text})
+    history[uid].append(message.text)
+    history[uid] = history[uid][-MAX_HISTORY:]
 
-    system_prompt = MODE_PROMPTS.get(user_mode.get(user_id, "chat"), DEFAULT_PROMPT)
+    system = build_system_prompt(uid)
+    prompt = message.text
 
-    contents = [{"role": "system", "content": system_prompt}]
-    contents.extend(history[user_id][-MAX_HISTORY:])
+    answer = await gemini_request([system] + history[uid])
 
-    answer = await gemini_text_request(contents)
-
-    history[user_id].append({"role": "assistant", "content": answer})
-    last_answer[user_id] = answer
-    save_history()
+    last_prompt[uid] = prompt
+    last_answer[uid] = answer
+    save_data()
 
     await message.answer(answer, reply_markup=answer_keyboard)
 
@@ -175,34 +209,32 @@ async def text_handler(message: Message):
 async def voice_handler(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    file = await message.bot.get_file(message.voice.file_id)
-    data = await message.bot.download_file(file.file_path)
+    file = await bot.get_file(message.voice.file_id)
+    data = await bot.download_file(file.file_path)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
-        tmp.write(data.read())
-        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
+        f.write(data.read())
+        path = f.name
 
-    result = whisper_model.transcribe(tmp_path, language="ru")
-    os.remove(tmp_path)
+    segments, _ = whisper_model.transcribe(path, language="ru")
+    os.remove(path)
 
-    text = result["text"].strip()
+    text = "".join(segment.text for segment in segments).strip()
+
     if not text:
-        await message.answer("Не удалось распознать речь")
+        await message.answer("❌ Не удалось распознать речь")
         return
 
-    await text_handler(Message(
-        message_id=message.message_id,
-        from_user=message.from_user,
-        chat=message.chat,
-        text=text
-    ))
+    await message.answer(f"🎙 Распознано:\n{text}")
+    message.text = text
+    await text_handler(message)
 
 @router.message(F.content_type == ContentType.DOCUMENT)
 async def document_handler(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    file = await message.bot.get_file(message.document.file_id)
-    data = await message.bot.download_file(file.file_path)
+    file = await bot.get_file(message.document.file_id)
+    data = await bot.download_file(file.file_path)
 
     text = ""
     if message.document.mime_type == "application/pdf":
@@ -214,14 +246,12 @@ async def document_handler(message: Message):
 
     text = text[:15000]
 
-    contents = [
-        {"role": "system", "content": "Кратко объясни содержание документа"},
-        {"role": "user", "content": text}
-    ]
+    answer = await gemini_request(
+        ["Кратко объясни содержание документа:", text]
+    )
 
-    answer = await gemini_text_request(contents)
     last_answer[message.from_user.id] = answer
-    save_history()
+    save_data()
 
     await message.answer(answer, reply_markup=answer_keyboard)
 
