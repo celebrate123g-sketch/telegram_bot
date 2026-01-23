@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import tempfile
+import time
+import requests
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
@@ -26,14 +28,13 @@ dp.include_router(router)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-whisper_model = WhisperModel(
-    "base",
-    device="cpu",
-    compute_type="int8"
-)
+whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 
 MAX_HISTORY = 10
 DATA_FILE = "bot_data.json"
+FLOOD_TIMEOUT = 5
+
+last_request_time = {}
 
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -59,6 +60,14 @@ def save_data():
             ensure_ascii=False,
             indent=2
         )
+
+def is_flood(uid: int) -> bool:
+    now = time.time()
+    last = last_request_time.get(uid, 0)
+    if now - last < FLOOD_TIMEOUT:
+        return True
+    last_request_time[uid] = now
+    return False
 
 def build_system_prompt(user_id: int) -> str:
     settings = user_settings.get(user_id, {})
@@ -90,6 +99,28 @@ async def gemini_request(messages: list[str]) -> str:
         logging.exception("Gemini error")
         return "❌ Ошибка при обращении к Gemini."
 
+def web_search(query: str) -> str:
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={
+                "q": query,
+                "format": "json",
+                "no_redirect": 1,
+                "no_html": 1
+            },
+            timeout=10
+        )
+        data = r.json()
+        text = data.get("AbstractText")
+        if not text:
+            related = data.get("RelatedTopics", [])
+            if related:
+                text = related[0].get("Text", "")
+        return text or "Ничего не найдено"
+    except Exception:
+        return "Ошибка поиска"
+
 main_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="⚙ Настройки", callback_data="settings")],
     [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="clear")]
@@ -117,7 +148,7 @@ async def start(message: Message):
     history.setdefault(uid, [])
     user_settings.setdefault(uid, {"lang": "ru", "verbose": "short"})
     await message.answer(
-        "Привет! Я бот на Gemini AI.\nМожешь писать текстом или голосом 🎤",
+        "Привет! Я бот на Gemini AI.\nКоманда /web включает поиск в интернете",
         reply_markup=main_keyboard
     )
 
@@ -175,31 +206,48 @@ async def answer_voice(callback: CallbackQuery):
         await callback.answer("Нет текста", show_alert=True)
         return
 
-    tts = gTTS(text=text, lang=user_settings.get(uid, {}).get("lang", "ru"))
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
-        tts.save(f.name)
-        audio = FSInputFile(f.name)
+    try:
+        tts = gTTS(text=text, lang=user_settings.get(uid, {}).get("lang", "ru"))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+            tts.save(f.name)
+            audio = FSInputFile(f.name)
 
-    await callback.message.answer_voice(audio)
-    os.remove(f.name)
+        await callback.message.answer_voice(audio)
+        os.remove(f.name)
+    except Exception:
+        await callback.message.answer("Ошибка озвучивания")
+
     await callback.answer()
 
 @router.message(F.text)
 async def text_handler(message: Message):
+    uid = message.from_user.id
+
+    if is_flood(uid):
+        await message.answer("⏳ Подожди немного")
+        return
+
+    text = message.text.strip()
+    if not text:
+        return
+
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    uid = message.from_user.id
     history.setdefault(uid, [])
-
-    history[uid].append(message.text)
+    history[uid].append(text)
     history[uid] = history[uid][-MAX_HISTORY:]
 
     system = build_system_prompt(uid)
-    prompt = message.text
 
-    answer = await gemini_request([system] + history[uid])
+    if text.startswith("/web"):
+        query = text.replace("/web", "").strip()
+        search = web_search(query)
+        prompt = f"Используя информацию из интернета:\n{search}\n\nОтветь на вопрос:\n{query}"
+        answer = await gemini_request([system, prompt])
+    else:
+        answer = await gemini_request([system] + history[uid])
 
-    last_prompt[uid] = prompt
+    last_prompt[uid] = text
     last_answer[uid] = answer
     save_data()
 
@@ -207,30 +255,45 @@ async def text_handler(message: Message):
 
 @router.message(F.voice)
 async def voice_handler(message: Message):
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    uid = message.from_user.id
 
-    file = await bot.get_file(message.voice.file_id)
-    data = await bot.download_file(file.file_path)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
-        f.write(data.read())
-        path = f.name
-
-    segments, _ = whisper_model.transcribe(path, language="ru")
-    os.remove(path)
-
-    text = "".join(segment.text for segment in segments).strip()
-
-    if not text:
-        await message.answer("❌ Не удалось распознать речь")
+    if is_flood(uid):
+        await message.answer("⏳ Подожди немного")
         return
 
-    await message.answer(f"🎙 Распознано:\n{text}")
-    message.text = text
-    await text_handler(message)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        data = await bot.download_file(file.file_path)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
+            f.write(data.read())
+            path = f.name
+
+        segments, _ = whisper_model.transcribe(path, language="ru")
+        os.remove(path)
+
+        text = "".join(segment.text for segment in segments).strip()
+
+        if not text:
+            await message.answer("❌ Не удалось распознать речь")
+            return
+
+        await message.answer(f"🎙 Распознано:\n{text}")
+        message.text = text
+        await text_handler(message)
+    except Exception:
+        await message.answer("Ошибка обработки голоса")
 
 @router.message(F.content_type == ContentType.DOCUMENT)
 async def document_handler(message: Message):
+    uid = message.from_user.id
+
+    if is_flood(uid):
+        await message.answer("⏳ Подожди немного")
+        return
+
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     file = await bot.get_file(message.document.file_id)
@@ -250,7 +313,7 @@ async def document_handler(message: Message):
         ["Кратко объясни содержание документа:", text]
     )
 
-    last_answer[message.from_user.id] = answer
+    last_answer[uid] = answer
     save_data()
 
     await message.answer(answer, reply_markup=answer_keyboard)
