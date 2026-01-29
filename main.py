@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 import time
+import random
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
@@ -66,7 +67,7 @@ def save_data():
         )
 
 def build_system_prompt(user_id: int, user_name: str = "") -> str:
-    settings = user_settings.get(user_id, {})
+    settings = user_settings.get(str(user_id), {})
     lang = settings.get("lang", "ru")
     verbose = settings.get("verbose", "short")
     mode = settings.get("mode", "normal")
@@ -159,8 +160,8 @@ answer_keyboard = InlineKeyboardMarkup(inline_keyboard=[
 @router.message(CommandStart())
 async def start(message: Message):
     uid = message.from_user.id
-    history.setdefault(uid, [])
-    user_settings.setdefault(uid, {
+    history.setdefault(str(uid), [])
+    user_settings.setdefault(str(uid), {
         "lang": "ru",
         "verbose": "short",
         "mode": "normal",
@@ -168,9 +169,43 @@ async def start(message: Message):
     })
 
     await message.answer(
-        "Привет! Я AI-бот на Gemini\nПиши текстом, голосом или отправляй файлы",
+        "Привет! Я AI-бот на Gemini\nПиши текстом, голосом или отправляй файлы\nКоманды: /history /fact /joke",
         reply_markup=main_keyboard
     )
+
+@router.message(F.text == "/history")
+async def show_history(message: Message):
+    uid = str(message.from_user.id)
+    user_history = history.get(uid, [])
+    if not user_history:
+        await message.answer("История пуста")
+        return
+    text = ""
+    for i, msg in enumerate(user_history[-10:], 1):
+        role = msg["role"]
+        parts = " ".join(msg["parts"])
+        text += f"{i}. {role}: {parts[:200]}...\n"
+    await message.answer(text)
+
+facts_list = [
+    "Слон — единственное животное, которое не умеет прыгать.",
+    "Пчёлы могут узнавать лица людей.",
+    "В Австралии есть больше кенгуру, чем людей."
+]
+
+jokes_list = [
+    "Почему компьютер всегда холодный? Потому что у него много вентиляторов.",
+    "Почему программисты путают Хэллоуин и Рождество? Потому что OCT 31 = DEC 25.",
+    "Как программист пьёт кофе? Через API."
+]
+
+@router.message(F.text == "/fact")
+async def fact(message: Message):
+    await message.answer(random.choice(facts_list))
+
+@router.message(F.text == "/joke")
+async def joke(message: Message):
+    await message.answer(random.choice(jokes_list))
 
 @router.message(F.text == "/settings")
 async def settings_cmd(message: Message):
@@ -186,7 +221,8 @@ async def format_cmd(message: Message):
 
 @router.message(F.text == "/clear")
 async def clear_cmd(message: Message):
-    history.pop(message.from_user.id, None)
+    uid = str(message.from_user.id)
+    history.pop(uid, None)
     save_data()
     await message.answer("История очищена")
 
@@ -207,7 +243,7 @@ async def choose_format(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("lang_") | F.data.in_({"short", "long"}))
 async def set_settings(callback: CallbackQuery):
-    uid = callback.from_user.id
+    uid = str(callback.from_user.id)
     user_settings.setdefault(uid, {})
 
     if callback.data.startswith("lang"):
@@ -221,7 +257,7 @@ async def set_settings(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("mode_"))
 async def set_mode(callback: CallbackQuery):
-    uid = callback.from_user.id
+    uid = str(callback.from_user.id)
     user_settings.setdefault(uid, {})["mode"] = callback.data.replace("mode_", "")
     save_data()
     await callback.message.answer("Режим изменён", reply_markup=main_keyboard)
@@ -229,7 +265,7 @@ async def set_mode(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fmt_"))
 async def set_format(callback: CallbackQuery):
-    uid = callback.from_user.id
+    uid = str(callback.from_user.id)
     user_settings.setdefault(uid, {})["format"] = callback.data.replace("fmt_", "")
     save_data()
     await callback.message.answer("Формат сохранён", reply_markup=main_keyboard)
@@ -237,14 +273,15 @@ async def set_format(callback: CallbackQuery):
 
 @router.callback_query(F.data == "clear")
 async def clear(callback: CallbackQuery):
-    history.pop(callback.from_user.id, None)
+    uid = str(callback.from_user.id)
+    history.pop(uid, None)
     save_data()
     await callback.message.answer("История очищена")
     await callback.answer()
 
 @router.callback_query(F.data == "regen")
 async def regenerate(callback: CallbackQuery):
-    uid = callback.from_user.id
+    uid = str(callback.from_user.id)
     prompt = last_prompt.get(uid)
 
     if not prompt:
@@ -252,7 +289,6 @@ async def regenerate(callback: CallbackQuery):
         return
 
     system = build_system_prompt(uid, callback.from_user.first_name)
-
     regen_prompt = f"Ответь иначе на вопрос:\n{prompt}"
 
     answer = await gemini_request([system, regen_prompt])
@@ -265,7 +301,7 @@ async def regenerate(callback: CallbackQuery):
 
 @router.callback_query(F.data == "voice")
 async def answer_voice(callback: CallbackQuery):
-    uid = callback.from_user.id
+    uid = str(callback.from_user.id)
     text = last_answer.get(uid)
 
     if not text:
@@ -285,13 +321,17 @@ async def answer_voice(callback: CallbackQuery):
 
 @router.message(F.text)
 async def text_handler(message: Message):
-    uid = message.from_user.id
+    uid = str(message.from_user.id)
 
     if time.time() - user_last_time.get(uid, 0) < 1:
         return
     user_last_time[uid] = time.time()
 
     logging.info(f"USER {uid}: {message.text}")
+
+    if last_prompt.get(uid) == message.text and last_answer.get(uid):
+        await message.answer(last_answer[uid], reply_markup=answer_keyboard)
+        return
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
@@ -357,7 +397,7 @@ async def document_handler(message: Message):
         text
     ])
 
-    last_answer[message.from_user.id] = answer
+    last_answer[str(message.from_user.id)] = answer
     save_data()
 
     await message.answer(answer, reply_markup=answer_keyboard)
