@@ -115,6 +115,44 @@ async def gemini_request(messages: list) -> str:
         logging.exception("Gemini error")
         return "Ошибка при обращении к AI"
 
+def split_text(text: str, max_len: int = 4000) -> list[str]:
+    parts = []
+    while text:
+        parts.append(text[:max_len])
+        text = text[max_len:]
+    return parts
+
+async def summarize_long_text(system_prompt: str, text: str) -> str:
+    chunks = split_text(text)
+    summaries = []
+
+    for i, chunk in enumerate(chunks, 1):
+        summary = await gemini_request([
+            system_prompt,
+            f"Часть {i}. Кратко перескажи содержание:\n{chunk}"
+        ])
+        summaries.append(summary)
+        await asyncio.sleep(0.2)
+
+    final_summary = await gemini_request([
+        system_prompt,
+        "На основе этих пересказов сделай итоговое краткое резюме:\n" + "\n".join(summaries)
+    ])
+    return final_summary
+
+async def generate_fun_content(kind: str, lang: str) -> str:
+    if kind == "fact":
+        prompt = "Расскажи один интересный и необычный факт."
+    else:
+        prompt = "Расскажи короткую смешную шутку."
+
+    if lang == "ru":
+        prompt += " На русском языке."
+    else:
+        prompt += " In English."
+
+    return await gemini_request([prompt])
+
 main_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="⚙ Настройки", callback_data="settings")],
     [InlineKeyboardButton(text="🧠 Режим мышления", callback_data="modes")],
@@ -187,192 +225,17 @@ async def show_history(message: Message):
         text += f"{i}. {role}: {parts[:200]}...\n"
     await message.answer(text)
 
-facts_list = [
-    "Слон — единственное животное, которое не умеет прыгать.",
-    "Пчёлы могут узнавать лица людей.",
-    "В Австралии есть больше кенгуру, чем людей."
-]
-
-jokes_list = [
-    "Почему компьютер всегда холодный? Потому что у него много вентиляторов.",
-    "Почему программисты путают Хэллоуин и Рождество? Потому что OCT 31 = DEC 25.",
-    "Как программист пьёт кофе? Через API."
-]
-
 @router.message(F.text == "/fact")
 async def fact(message: Message):
-    await message.answer(random.choice(facts_list))
+    uid = str(message.from_user.id)
+    lang = user_settings.get(uid, {}).get("lang", "ru")
+    await message.answer(await generate_fun_content("fact", lang))
 
 @router.message(F.text == "/joke")
 async def joke(message: Message):
-    await message.answer(random.choice(jokes_list))
-
-@router.message(F.text == "/settings")
-async def settings_cmd(message: Message):
-    await message.answer("Настройки:", reply_markup=settings_keyboard)
-
-@router.message(F.text == "/mode")
-async def mode_cmd(message: Message):
-    await message.answer("Режим мышления:", reply_markup=modes_keyboard)
-
-@router.message(F.text == "/format")
-async def format_cmd(message: Message):
-    await message.answer("Формат ответа:", reply_markup=format_keyboard)
-
-@router.message(F.text == "/clear")
-async def clear_cmd(message: Message):
     uid = str(message.from_user.id)
-    history.pop(uid, None)
-    save_data()
-    await message.answer("История очищена")
-
-@router.callback_query(F.data == "settings")
-async def settings(callback: CallbackQuery):
-    await callback.message.answer("Настройки:", reply_markup=settings_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data == "modes")
-async def modes(callback: CallbackQuery):
-    await callback.message.answer("Режим мышления:", reply_markup=modes_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data == "format")
-async def choose_format(callback: CallbackQuery):
-    await callback.message.answer("Формат ответа:", reply_markup=format_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("lang_") | F.data.in_({"short", "long"}))
-async def set_settings(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    user_settings.setdefault(uid, {})
-
-    if callback.data.startswith("lang"):
-        user_settings[uid]["lang"] = callback.data.split("_")[1]
-    else:
-        user_settings[uid]["verbose"] = callback.data
-
-    save_data()
-    await callback.message.answer("Настройки сохранены", reply_markup=main_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("mode_"))
-async def set_mode(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    user_settings.setdefault(uid, {})["mode"] = callback.data.replace("mode_", "")
-    save_data()
-    await callback.message.answer("Режим изменён", reply_markup=main_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("fmt_"))
-async def set_format(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    user_settings.setdefault(uid, {})["format"] = callback.data.replace("fmt_", "")
-    save_data()
-    await callback.message.answer("Формат сохранён", reply_markup=main_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data == "clear")
-async def clear(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    history.pop(uid, None)
-    save_data()
-    await callback.message.answer("История очищена")
-    await callback.answer()
-
-@router.callback_query(F.data == "regen")
-async def regenerate(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    prompt = last_prompt.get(uid)
-
-    if not prompt:
-        await callback.answer("Нечего перегенерировать", show_alert=True)
-        return
-
-    system = build_system_prompt(uid, callback.from_user.first_name)
-    regen_prompt = f"Ответь иначе на вопрос:\n{prompt}"
-
-    answer = await gemini_request([system, regen_prompt])
-
-    last_answer[uid] = answer
-    save_data()
-
-    await callback.message.answer(answer, reply_markup=answer_keyboard)
-    await callback.answer()
-
-@router.callback_query(F.data == "voice")
-async def answer_voice(callback: CallbackQuery):
-    uid = str(callback.from_user.id)
-    text = last_answer.get(uid)
-
-    if not text:
-        await callback.answer("Нет текста", show_alert=True)
-        return
-
     lang = user_settings.get(uid, {}).get("lang", "ru")
-    tts = gTTS(text=text[:500], lang=lang)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
-        tts.save(f.name)
-        audio = FSInputFile(f.name)
-
-    await callback.message.answer_voice(audio)
-    os.remove(f.name)
-    await callback.answer()
-
-@router.message(F.text)
-async def text_handler(message: Message):
-    uid = str(message.from_user.id)
-
-    if time.time() - user_last_time.get(uid, 0) < 1:
-        return
-    user_last_time[uid] = time.time()
-
-    logging.info(f"USER {uid}: {message.text}")
-
-    if last_prompt.get(uid) == message.text and last_answer.get(uid):
-        await message.answer(last_answer[uid], reply_markup=answer_keyboard)
-        return
-
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    history.setdefault(uid, [])
-    history[uid].append({"role": "user", "parts": [message.text]})
-    history[uid] = history[uid][-MAX_HISTORY:]
-
-    system = build_system_prompt(uid, message.from_user.first_name)
-    answer = await gemini_request([system] + history[uid])
-
-    history[uid].append({"role": "model", "parts": [answer]})
-
-    last_prompt[uid] = message.text
-    last_answer[uid] = answer
-    save_data()
-
-    logging.info(f"BOT {uid}: {answer[:200]}")
-
-    await message.answer(answer, reply_markup=answer_keyboard)
-
-@router.message(F.voice)
-async def voice_handler(message: Message):
-    file = await bot.get_file(message.voice.file_id)
-    data = await bot.download_file(file.file_path)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
-        f.write(data.read())
-        path = f.name
-
-    segments, _ = whisper_model.transcribe(path, language="ru")
-    os.remove(path)
-
-    text = "".join(segment.text for segment in segments).strip()
-
-    if not text:
-        await message.answer("Не удалось распознать речь")
-        return
-
-    await message.answer(f"Распознано:\n{text}")
-    message.text = text
-    await text_handler(message)
+    await message.answer(await generate_fun_content("joke", lang))
 
 @router.message(F.content_type == ContentType.DOCUMENT)
 async def document_handler(message: Message):
@@ -387,15 +250,11 @@ async def document_handler(message: Message):
     else:
         text = data.read().decode("utf-8", errors="ignore")
 
-    text = text[:15000]
-
     system = build_system_prompt(message.from_user.id, message.from_user.first_name)
 
-    answer = await gemini_request([
-        system,
-        "Кратко объясни содержание документа",
-        text
-    ])
+    await message.answer("📄 Анализирую документ...")
+
+    answer = await summarize_long_text(system, text)
 
     last_answer[str(message.from_user.id)] = answer
     save_data()
