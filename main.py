@@ -5,7 +5,6 @@ import logging
 import os
 import tempfile
 import time
-import random
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -34,6 +33,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 
 MAX_HISTORY = 10
+MAX_TEXT_LEN = 6000
 DATA_FILE = "bot_data.json"
 
 if os.path.exists(DATA_FILE):
@@ -45,61 +45,58 @@ else:
 history = data.get("history", {})
 user_settings = data.get("user_settings", {})
 last_answer = data.get("last_answer", {})
-last_prompt = data.get("last_prompt", {})
 stats = data.get("stats", {})
 user_last_time = {}
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "history": history,
-            "user_settings": user_settings,
-            "last_answer": last_answer,
-            "last_prompt": last_prompt,
-            "stats": stats
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "history": history,
+                "user_settings": user_settings,
+                "last_answer": last_answer,
+                "stats": stats
+            },
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
 
-def check_flood(uid: int, delay: float = 2.0) -> bool:
+def check_flood(uid, delay=2.0):
     now = time.time()
     if now - user_last_time.get(uid, 0) < delay:
         return False
     user_last_time[uid] = now
     return True
 
-def detect_lang(text: str) -> str:
+def detect_lang(text):
     ru = sum("а" <= c <= "я" or "А" <= c <= "Я" for c in text)
     en = sum("a" <= c.lower() <= "z" for c in text)
     return "ru" if ru >= en else "en"
 
-def build_system_prompt(uid: int, name: str = "") -> str:
+def build_system_prompt(uid, name=""):
     s = user_settings.get(str(uid), {})
     lang = s.get("lang", "ru")
     verbose = s.get("verbose", "short")
     mode = s.get("mode", "normal")
-    fmt = s.get("format", "text")
 
     p = "Ты умный AI-ассистент."
     if name:
         p += f" Общайся с пользователем по имени {name}."
     p += " Отвечай строго на русском." if lang == "ru" else " Answer strictly in English."
-    p += " Кратко и по делу." if verbose == "short" else " Подробно, с примерами."
+    p += " Кратко и по делу." if verbose == "short" else " Подробно и с примерами."
 
     if mode == "smart":
-        p += " Сначала проанализируй, затем дай итог."
+        p += " Сначала сделай анализ, потом вывод."
     elif mode == "teacher":
-        p += " Объясняй как новичку, по шагам."
+        p += " Объясняй максимально просто."
     elif mode == "creative":
-        p += " Используй метафоры и нестандартный стиль."
-
-    if fmt == "list":
-        p += " Формат — список."
-    elif fmt == "json":
-        p += " Ответ строго JSON."
+        p += " Будь креативным."
 
     p += " Не повторяй вопрос."
     return p
 
-async def gemini_request(messages: list) -> str:
+async def gemini_request(messages):
     try:
         r = client.models.generate_content(
             model="gemini-1.5-flash",
@@ -120,9 +117,11 @@ async def summarize(system, text):
         res.append(r)
     return await gemini_request([system, "Сделай итоговое резюме:\n" + "\n".join(res)])
 
-answer_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")]
-])
+answer_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")]
+    ]
+)
 
 @router.message(CommandStart())
 async def start(message: Message):
@@ -132,19 +131,39 @@ async def start(message: Message):
     user_settings.setdefault(uid, {
         "lang": "ru",
         "verbose": "short",
-        "mode": "normal",
-        "format": "text"
+        "mode": "normal"
     })
-    await message.answer("👋 Gemini AI бот\nПиши текст или отправляй файлы")
+    await message.answer("Привет. Пиши текстом, голосом или отправляй файлы")
 
-@router.message(F.text == "/stats")
-async def show_stats(message: Message):
-    s = stats.get(str(message.from_user.id), {})
-    await message.answer(
-        f"📊 Статистика\n"
-        f"Сообщений: {s.get('messages',0)}\n"
-        f"Файлов: {s.get('files',0)}"
-    )
+@router.message(F.text == "/shorten")
+async def shorten(message: Message):
+    uid = str(message.from_user.id)
+    if uid not in last_answer:
+        return await message.answer("Нет предыдущего ответа")
+    system = build_system_prompt(message.from_user.id)
+    answer = await gemini_request([system, "Сократи текст:\n" + last_answer[uid]])
+    last_answer[uid] = answer
+    await message.answer(answer)
+
+@router.message(F.text == "/rewrite")
+async def rewrite(message: Message):
+    uid = str(message.from_user.id)
+    if uid not in last_answer:
+        return await message.answer("Нет предыдущего ответа")
+    system = build_system_prompt(message.from_user.id)
+    answer = await gemini_request([system, "Перепиши текст по другому:\n" + last_answer[uid]])
+    last_answer[uid] = answer
+    await message.answer(answer)
+
+@router.message(F.text == "/translate")
+async def translate(message: Message):
+    uid = str(message.from_user.id)
+    if uid not in last_answer:
+        return await message.answer("Нет предыдущего ответа")
+    system = build_system_prompt(message.from_user.id)
+    answer = await gemini_request([system, "Переведи текст:\n" + last_answer[uid]])
+    last_answer[uid] = answer
+    await message.answer(answer)
 
 @router.message(F.text)
 async def text_handler(message: Message):
@@ -154,18 +173,53 @@ async def text_handler(message: Message):
     if not check_flood(uid):
         return
 
+    if len(message.text) > MAX_TEXT_LEN:
+        return await message.answer("Слишком длинный текст")
+
     stats.setdefault(uid_s, {"messages": 0, "files": 0})
     stats[uid_s]["messages"] += 1
 
     user_settings[uid_s]["lang"] = detect_lang(message.text)
 
     system = build_system_prompt(uid, message.from_user.first_name)
-    answer = await gemini_request([system, message.text])
+
+    messages = [system]
+    for h in history.get(uid_s, []):
+        messages.append(h)
+    messages.append(message.text)
+
+    answer = await gemini_request(messages)
+
+    history.setdefault(uid_s, []).append(message.text)
+    history[uid_s].append(answer)
+    history[uid_s] = history[uid_s][-MAX_HISTORY:]
 
     last_answer[uid_s] = answer
     save_data()
 
     await message.answer(answer, reply_markup=answer_keyboard)
+
+@router.message(F.voice)
+async def voice_handler(message: Message):
+    uid = message.from_user.id
+    uid_s = str(uid)
+
+    file = await bot.get_file(message.voice.file_id)
+    ogg_path = tempfile.mktemp(suffix=".ogg")
+    await bot.download_file(file.file_path, ogg_path)
+
+    segments, _ = whisper_model.transcribe(ogg_path)
+    text = "".join(s.text for s in segments)
+
+    system = build_system_prompt(uid, message.from_user.first_name)
+    answer = await gemini_request([system, text])
+
+    tts = gTTS(answer, lang=user_settings.get(uid_s, {}).get("lang", "ru"))
+    mp3_path = tempfile.mktemp(suffix=".mp3")
+    tts.save(mp3_path)
+
+    last_answer[uid_s] = answer
+    await message.answer_voice(open(mp3_path, "rb"))
 
 @router.message(F.content_type == ContentType.DOCUMENT)
 async def document_handler(message: Message):
@@ -185,14 +239,7 @@ async def document_handler(message: Message):
         text = data.read().decode("utf-8", errors="ignore")
 
     system = build_system_prompt(message.from_user.id, message.from_user.first_name)
-
-    name = message.document.file_name.lower()
-    if name.endswith(".py"):
-        answer = await gemini_request([system, "Объясни код и найди ошибки:\n" + text])
-    elif name.endswith(".json"):
-        answer = await gemini_request([system, "Объясни структуру JSON:\n" + text])
-    else:
-        answer = await summarize(system, text)
+    answer = await summarize(system, text)
 
     last_answer[uid] = answer
     save_data()
