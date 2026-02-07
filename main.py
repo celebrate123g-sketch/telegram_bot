@@ -42,8 +42,8 @@ else:
 history = data.get("history", {})
 user_settings = data.get("user_settings", {})
 last_answer = data.get("last_answer", {})
-last_prompt = {}
 stats = data.get("stats", {})
+last_prompt = {}
 user_last_time = {}
 
 def save_data():
@@ -112,7 +112,9 @@ async def summarize(system, text):
     return await gemini_request([system, "Сделай итоговое резюме:\n" + "\n".join(parts)])
 
 answer_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[[InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")]]
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")]
+    ]
 )
 
 @router.message(CommandStart())
@@ -121,7 +123,49 @@ async def start(message: Message):
     history.setdefault(uid, [])
     stats.setdefault(uid, {"messages": 0, "files": 0, "voice": 0})
     user_settings.setdefault(uid, {"lang": "ru", "verbose": "short", "mode": "normal"})
-    await message.answer("Привет. Пиши текстом, голосом или отправляй файлы")
+    await message.answer("Привет. Доступно:\n/lang ru|en\n/mode normal|smart|teacher|creative\n/verbose short|full\n/clear")
+
+@router.message(F.text.startswith("/lang"))
+async def set_lang(message: Message):
+    uid = str(message.from_user.id)
+    lang = message.text.replace("/lang", "").strip()
+    if lang not in ("ru", "en"):
+        return await message.answer("Используй /lang ru или /lang en")
+    user_settings.setdefault(uid, {})
+    user_settings[uid]["lang"] = lang
+    save_data()
+    await message.answer(f"Язык установлен: {lang}")
+
+@router.message(F.text.startswith("/mode"))
+async def set_mode(message: Message):
+    uid = str(message.from_user.id)
+    mode = message.text.replace("/mode", "").strip()
+    if mode not in ("normal", "smart", "teacher", "creative"):
+        return await message.answer("Режимы: normal smart teacher creative")
+    user_settings.setdefault(uid, {})
+    user_settings[uid]["mode"] = mode
+    save_data()
+    await message.answer(f"Режим установлен: {mode}")
+
+@router.message(F.text.startswith("/verbose"))
+async def set_verbose(message: Message):
+    uid = str(message.from_user.id)
+    v = message.text.replace("/verbose", "").strip()
+    if v not in ("short", "full"):
+        return await message.answer("Используй /verbose short или /verbose full")
+    user_settings.setdefault(uid, {})
+    user_settings[uid]["verbose"] = v
+    save_data()
+    await message.answer(f"Формат ответов: {v}")
+
+@router.message(F.text == "/clear")
+async def clear_history(message: Message):
+    uid = str(message.from_user.id)
+    history[uid] = []
+    last_prompt.pop(uid, None)
+    last_answer.pop(uid, None)
+    save_data()
+    await message.answer("История очищена")
 
 @router.message(F.text)
 async def text_handler(message: Message):
@@ -141,7 +185,6 @@ async def text_handler(message: Message):
     user_settings[uid_s]["lang"] = detect_lang(message.text)
 
     system = build_system_prompt(uid, message.from_user.first_name)
-
     messages = [system] + history.get(uid_s, []) + [message.text]
     last_prompt[uid_s] = messages
 
@@ -217,11 +260,9 @@ async def regen(call: CallbackQuery):
     uid_s = str(call.from_user.id)
     if uid_s not in last_prompt:
         return await call.answer("Нечего перегенерировать", show_alert=True)
-
     answer = await gemini_request(last_prompt[uid_s])
     last_answer[uid_s] = answer
     save_data()
-
     await call.message.answer(answer, reply_markup=answer_keyboard)
 
 async def main():
