@@ -41,6 +41,7 @@ else:
 
 history = data.get("history", {})
 user_settings = data.get("user_settings", {})
+user_memory = data.get("user_memory", {})
 last_answer = data.get("last_answer", {})
 stats = data.get("stats", {})
 last_prompt = {}
@@ -52,6 +53,7 @@ def save_data():
             {
                 "history": history,
                 "user_settings": user_settings,
+                "user_memory": user_memory,
                 "last_answer": last_answer,
                 "stats": stats
             },
@@ -74,13 +76,19 @@ def detect_lang(text):
 
 def build_system_prompt(uid, name=""):
     s = user_settings.get(str(uid), {})
+    m = user_memory.get(str(uid), {})
     lang = s.get("lang", "ru")
     verbose = s.get("verbose", "short")
     mode = s.get("mode", "normal")
+    model = s.get("model", "flash")
 
     p = "Ты умный AI-ассистент."
     if name:
-        p += f" Общайся с пользователем по имени {name}."
+        p += f" Пользователя зовут {name}."
+    if m:
+        p += " Факты о пользователе:"
+        for k, v in m.items():
+            p += f" {k}: {v}."
     p += " Отвечай строго на русском." if lang == "ru" else " Answer strictly in English."
     p += " Кратко и по делу." if verbose == "short" else " Подробно и с примерами."
 
@@ -94,9 +102,11 @@ def build_system_prompt(uid, name=""):
     p += " Не повторяй вопрос."
     return p
 
-async def gemini_request(messages):
+async def gemini_request(messages, uid):
+    model = user_settings.get(str(uid), {}).get("model", "flash")
+    model_name = "gemini-1.5-pro" if model == "pro" else "gemini-1.5-flash"
     try:
-        r = client.models.generate_content(model="gemini-1.5-flash", contents=messages)
+        r = client.models.generate_content(model=model_name, contents=messages)
         return r.text.strip()
     except Exception:
         return "Ошибка AI"
@@ -104,17 +114,15 @@ async def gemini_request(messages):
 def split_text(text, size=4000):
     return [text[i:i + size] for i in range(0, len(text), size)]
 
-async def summarize(system, text):
+async def summarize(system, text, uid):
     chunks = split_text(text)
     parts = []
     for i, c in enumerate(chunks, 1):
-        parts.append(await gemini_request([system, f"Часть {i}:\n{c}"]))
-    return await gemini_request([system, "Сделай итоговое резюме:\n" + "\n".join(parts)])
+        parts.append(await gemini_request([system, f"Часть {i}:\n{c}"], uid))
+    return await gemini_request([system, "Сделай итоговое резюме:\n" + "\n".join(parts)], uid)
 
 answer_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")]
-    ]
+    inline_keyboard=[[InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen")]]
 )
 
 @router.message(CommandStart())
@@ -122,50 +130,47 @@ async def start(message: Message):
     uid = str(message.from_user.id)
     history.setdefault(uid, [])
     stats.setdefault(uid, {"messages": 0, "files": 0, "voice": 0})
-    user_settings.setdefault(uid, {"lang": "ru", "verbose": "short", "mode": "normal"})
-    await message.answer("Привет. Доступно:\n/lang ru|en\n/mode normal|smart|teacher|creative\n/verbose short|full\n/clear")
+    user_settings.setdefault(uid, {"lang": "ru", "verbose": "short", "mode": "normal", "model": "flash"})
+    user_memory.setdefault(uid, {})
+    await message.answer("Привет. Я могу запоминать факты о тебе и использовать их в ответах.\nПримеры:\nзови меня Алекс\nя люблю программирование\nя живу в Ташкенте\n/model flash или /model pro")
 
-@router.message(F.text.startswith("/lang"))
-async def set_lang(message: Message):
+@router.message(F.text.startswith("/model"))
+async def set_model(message: Message):
     uid = str(message.from_user.id)
-    lang = message.text.replace("/lang", "").strip()
-    if lang not in ("ru", "en"):
-        return await message.answer("Используй /lang ru или /lang en")
+    model = message.text.replace("/model", "").strip()
+    if model not in ("flash", "pro"):
+        return await message.answer("Используй /model flash или /model pro")
     user_settings.setdefault(uid, {})
-    user_settings[uid]["lang"] = lang
+    user_settings[uid]["model"] = model
     save_data()
-    await message.answer(f"Язык установлен: {lang}")
+    await message.answer(f"Модель установлена: {model}")
 
-@router.message(F.text.startswith("/mode"))
-async def set_mode(message: Message):
+@router.message(F.text.regexp(r"^(зови меня|меня зовут) "))
+async def set_name(message: Message):
     uid = str(message.from_user.id)
-    mode = message.text.replace("/mode", "").strip()
-    if mode not in ("normal", "smart", "teacher", "creative"):
-        return await message.answer("Режимы: normal smart teacher creative")
-    user_settings.setdefault(uid, {})
-    user_settings[uid]["mode"] = mode
+    name = message.text.split(" ", 2)[-1]
+    user_memory.setdefault(uid, {})
+    user_memory[uid]["имя"] = name
     save_data()
-    await message.answer(f"Режим установлен: {mode}")
+    await message.answer(f"Хорошо, буду звать тебя {name}")
 
-@router.message(F.text.startswith("/verbose"))
-async def set_verbose(message: Message):
+@router.message(F.text.regexp(r"^я люблю "))
+async def set_love(message: Message):
     uid = str(message.from_user.id)
-    v = message.text.replace("/verbose", "").strip()
-    if v not in ("short", "full"):
-        return await message.answer("Используй /verbose short или /verbose full")
-    user_settings.setdefault(uid, {})
-    user_settings[uid]["verbose"] = v
+    val = message.text.replace("я люблю", "").strip()
+    user_memory.setdefault(uid, {})
+    user_memory[uid]["любит"] = val
     save_data()
-    await message.answer(f"Формат ответов: {v}")
+    await message.answer("Запомнил")
 
-@router.message(F.text == "/clear")
-async def clear_history(message: Message):
+@router.message(F.text.regexp(r"^я живу "))
+async def set_live(message: Message):
     uid = str(message.from_user.id)
-    history[uid] = []
-    last_prompt.pop(uid, None)
-    last_answer.pop(uid, None)
+    val = message.text.replace("я живу", "").strip()
+    user_memory.setdefault(uid, {})
+    user_memory[uid]["место жительства"] = val
     save_data()
-    await message.answer("История очищена")
+    await message.answer("Запомнил")
 
 @router.message(F.text)
 async def text_handler(message: Message):
@@ -181,74 +186,17 @@ async def text_handler(message: Message):
     stats.setdefault(uid_s, {"messages": 0, "files": 0, "voice": 0})
     stats[uid_s]["messages"] += 1
 
-    user_settings.setdefault(uid_s, {"lang": "ru", "verbose": "short", "mode": "normal"})
+    user_settings.setdefault(uid_s, {"lang": "ru", "verbose": "short", "mode": "normal", "model": "flash"})
     user_settings[uid_s]["lang"] = detect_lang(message.text)
 
     system = build_system_prompt(uid, message.from_user.first_name)
     messages = [system] + history.get(uid_s, []) + [message.text]
     last_prompt[uid_s] = messages
 
-    answer = await gemini_request(messages)
+    answer = await gemini_request(messages, uid)
 
     history.setdefault(uid_s, []).extend([message.text, answer])
     history[uid_s] = history[uid_s][-MAX_HISTORY:]
-
-    last_answer[uid_s] = answer
-    save_data()
-
-    await message.answer(answer, reply_markup=answer_keyboard)
-
-@router.message(F.voice)
-async def voice_handler(message: Message):
-    uid_s = str(message.from_user.id)
-    stats.setdefault(uid_s, {"messages": 0, "files": 0, "voice": 0})
-    stats[uid_s]["voice"] += 1
-
-    file = await bot.get_file(message.voice.file_id)
-    ogg = tempfile.mktemp(".ogg")
-    mp3 = tempfile.mktemp(".mp3")
-
-    await bot.download_file(file.file_path, ogg)
-    segments, _ = whisper_model.transcribe(ogg)
-    text = "".join(s.text for s in segments)
-
-    system = build_system_prompt(uid_s, message.from_user.first_name)
-    answer = await gemini_request([system, text])
-
-    gTTS(answer, lang=user_settings.get(uid_s, {}).get("lang", "ru")).save(mp3)
-    last_answer[uid_s] = answer
-
-    await message.answer_voice(open(mp3, "rb"))
-
-    os.remove(ogg)
-    os.remove(mp3)
-
-@router.message(F.content_type == ContentType.DOCUMENT)
-async def document_handler(message: Message):
-    uid_s = str(message.from_user.id)
-    stats.setdefault(uid_s, {"messages": 0, "files": 0, "voice": 0})
-    stats[uid_s]["files"] += 1
-
-    file = await bot.get_file(message.document.file_id)
-    data = await bot.download_file(file.file_path)
-    raw = data.read()
-    text = ""
-
-    if message.document.mime_type == "application/pdf":
-        with pdfplumber.open(io.BytesIO(raw)) as pdf:
-            for p in pdf.pages:
-                text += p.extract_text() or ""
-    elif message.document.mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        doc = Document(io.BytesIO(raw))
-        text = "\n".join(p.text for p in doc.paragraphs)
-    else:
-        text = raw.decode("utf-8", errors="ignore")
-
-    if not text.strip():
-        return await message.answer("Файл пуст или не читается")
-
-    system = build_system_prompt(uid_s, message.from_user.first_name)
-    answer = await summarize(system, text)
 
     last_answer[uid_s] = answer
     save_data()
@@ -260,7 +208,7 @@ async def regen(call: CallbackQuery):
     uid_s = str(call.from_user.id)
     if uid_s not in last_prompt:
         return await call.answer("Нечего перегенерировать", show_alert=True)
-    answer = await gemini_request(last_prompt[uid_s])
+    answer = await gemini_request(last_prompt[uid_s], call.from_user.id)
     last_answer[uid_s] = answer
     save_data()
     await call.message.answer(answer, reply_markup=answer_keyboard)
