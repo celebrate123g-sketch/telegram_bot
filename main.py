@@ -24,6 +24,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 DATA_FILE = "bot_data.json"
 FLOOD_DELAY = 1.5
 RATES_CACHE_TTL = 600
+EXAM_TIME_LIMIT = 30
 
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -63,7 +64,6 @@ def get_rates():
     now = time.time()
     if rates_cache["data"] and now - rates_cache["time"] < RATES_CACHE_TTL:
         return rates_cache["data"]
-
     r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()
     rates_cache["data"] = r["rates"]
     rates_cache["time"] = now
@@ -79,7 +79,7 @@ def system_prompt(uid):
         return "Отвечай максимально кратко."
     return "Ты полезный AI ассистент."
 
-async def gemini(messages, uid):
+async def gemini(messages):
     loop = asyncio.get_running_loop()
     def call():
         return client.models.generate_content(
@@ -90,23 +90,31 @@ async def gemini(messages, uid):
 
 async def send_question(m, uid):
     state = exam_state[uid]
-    difficulty = state["difficulty"]
-
     messages = [
-        {"role": "system", "parts": [f"Создай 1 вопрос по теме {state['topic']} сложность {difficulty} без ответа."]}
+        {"role": "system", "parts": [f"Создай 1 вопрос по теме {state['topic']} сложность {state['difficulty']} без ответа."]}
     ]
-
-    r = await gemini(messages, uid)
+    r = await gemini(messages)
     state["last_question"] = r.text
-    await m.answer(f"Вопрос {state['number']+1}/5\n\n{r.text}")
+    state["question_time"] = time.time()
+    await m.answer(f"Вопрос {state['number']+1}/5\n\n{r.text}\n\nУ тебя 30 секунд.")
 
 @router.message(CommandStart())
 async def start(m: Message):
     uid = str(m.from_user.id)
     history.setdefault(uid, [])
     user_settings.setdefault(uid, {"mode": "assistant"})
-    stats.setdefault(uid, {"messages": 0})
-    await m.answer("Команды:\n/rates\n/convert\n/exam <topic>\n/mode")
+    stats.setdefault(uid, {"messages": 0, "exams": 0, "avg_score": 0})
+    await m.answer("Команды:\n/rates\n/convert\n/exam <topic>\n/mode\n/stats")
+
+@router.message(Command("stats"))
+async def stats_cmd(m: Message):
+    uid = str(m.from_user.id)
+    s = stats.get(uid, {"messages": 0, "exams": 0, "avg_score": 0})
+    await m.answer(
+        f"Сообщений: {s['messages']}\n"
+        f"Экзаменов: {s['exams']}\n"
+        f"Средний результат: {s['avg_score']}%"
+    )
 
 @router.message(Command("mode"))
 async def mode_cmd(m: Message):
@@ -123,40 +131,31 @@ async def mode_cmd(m: Message):
 async def rates_cmd(m: Message):
     rates = get_rates()
     text = (
-        f"USD → RUB: {rates['RUB']:.2f}\n"
-        f"USD → UZS: {rates['UZS']:.2f}\n"
-        f"EUR → RUB: {rates['EUR']*rates['RUB']:.2f}\n"
-        f"GBP → RUB: {rates['GBP']*rates['RUB']:.2f}"
+        f"USD → RUB: {rates.get('RUB',0):.2f}\n"
+        f"USD → UZS: {rates.get('UZS',0):.2f}\n"
+        f"EUR → RUB: {rates.get('EUR',0)*rates.get('RUB',0):.2f}\n"
+        f"GBP → RUB: {rates.get('GBP',0)*rates.get('RUB',0):.2f}"
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="USD→RUB", callback_data="usd_rub"),
-             InlineKeyboardButton(text="USD→UZS", callback_data="usd_uzs")]
-        ]
-    )
-    await m.answer(text, reply_markup=kb)
+    await m.answer(text)
 
 @router.message(Command("convert"))
 async def convert_cmd(m: Message):
     parts = m.text.split()
     if len(parts) != 4:
         return await m.answer("Пример: /convert 100 usd rub")
-    amount = float(parts[1])
+    try:
+        amount = float(parts[1])
+    except:
+        return await m.answer("Сумма должна быть числом")
     from_cur = parts[2].upper()
     to_cur = parts[3].upper()
     rates = get_rates()
+    if from_cur not in rates or to_cur not in rates:
+        return await m.answer("Валюта не найдена")
     if from_cur != "USD":
         amount = amount / rates[from_cur]
     result = amount * rates[to_cur]
-    await m.answer(f"{result:.2f} {to_cur}")
-
-@router.callback_query()
-async def cb(c: CallbackQuery):
-    rates = get_rates()
-    if c.data == "usd_rub":
-        await c.message.answer(f"1 USD = {rates['RUB']:.2f} RUB")
-    if c.data == "usd_uzs":
-        await c.message.answer(f"1 USD = {rates['UZS']:.2f} UZS")
+    await m.answer(f"{amount:.2f} {from_cur} = {result:.2f} {to_cur}")
 
 @router.message(Command("exam"))
 async def exam_cmd(m: Message):
@@ -169,7 +168,8 @@ async def exam_cmd(m: Message):
         "number": 0,
         "correct": 0,
         "difficulty": 2,
-        "last_question": ""
+        "last_question": "",
+        "question_time": 0
     }
     await m.answer("Экзамен начат")
     await send_question(m, uid)
@@ -182,32 +182,51 @@ async def text_handler(m: Message):
 
     if uid in exam_state:
         state = exam_state[uid]
-        messages = [
-            {"role": "system", "parts": ["Ответь только correct или wrong"]},
-            {"role": "user", "parts": [f"Вопрос: {state['last_question']}\nОтвет: {m.text}"]}
-        ]
-        r = await gemini(messages, uid)
-        if "correct" in r.text.lower():
-            state["correct"] += 1
-            state["difficulty"] = min(5, state["difficulty"]+1)
-        else:
+        if time.time() - state["question_time"] > EXAM_TIME_LIMIT:
+            state["number"] += 1
             state["difficulty"] = max(1, state["difficulty"]-1)
-        state["number"] += 1
+            await m.answer("Время вышло")
+        else:
+            messages = [
+                {"role": "system", "parts": ["Ответь только correct или wrong"]},
+                {"role": "user", "parts": [f"Вопрос: {state['last_question']}\nОтвет: {m.text}"]}
+            ]
+            r = await gemini(messages)
+            if "correct" in r.text.lower():
+                state["correct"] += 1
+                state["difficulty"] = min(5, state["difficulty"]+1)
+            else:
+                state["difficulty"] = max(1, state["difficulty"]-1)
+            state["number"] += 1
+
         if state["number"] >= 5:
             percent = state["correct"]*20
+            stats[uid]["exams"] += 1
+            prev_avg = stats[uid]["avg_score"]
+            total_exams = stats[uid]["exams"]
+            stats[uid]["avg_score"] = int((prev_avg*(total_exams-1)+percent)/total_exams)
             del exam_state[uid]
-            return await m.answer(f"Результат: {percent}%")
+            save()
+            return await m.answer(f"Экзамен завершен\nРезультат: {percent}%")
+
+        save()
         return await send_question(m, uid)
 
     stats[uid]["messages"] += 1
 
-    messages = [
-        {"role": "system", "parts": [system_prompt(uid)]},
-        {"role": "user", "parts": [m.text]}
-    ]
+    recent_history = history.get(uid, [])[-6:]
+    messages = [{"role": "system", "parts": [system_prompt(uid)]}]
+    for msg in recent_history:
+        messages.append({"role": "user", "parts": [msg]})
+    messages.append({"role": "user", "parts": [m.text]})
 
-    r = await gemini(messages, uid)
+    r = await gemini(messages)
     await m.answer(r.text)
+
+    history.setdefault(uid, [])
+    history[uid].append(m.text)
+    history[uid].append(r.text)
+    history[uid] = history[uid][-10:]
     save()
 
 async def main():
