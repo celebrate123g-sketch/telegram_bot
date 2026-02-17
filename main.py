@@ -26,6 +26,9 @@ DATA_FILE = "bot_data.json"
 FLOOD_DELAY = 1.5
 RATES_CACHE_TTL = 600
 DAILY_XP = 20
+MAX_HISTORY = 10
+MAX_DAILY_MSG_XP = 100
+ADMIN_ID = "YOUR_TELEGRAM_ID"
 
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -78,14 +81,14 @@ def progress_bar(current, total, length=10):
 
 def get_rank(level):
     if level <= 3:
-        return "Новичок"
+        return "🥉 Новичок"
     if level <= 7:
-        return "Ученик"
+        return "🥈 Ученик"
     if level <= 12:
-        return "Продвинутый"
+        return "🥇 Продвинутый"
     if level <= 20:
-        return "Эксперт"
-    return "Мастер"
+        return "💎 Эксперт"
+    return "👑 Мастер"
 
 def add_xp(uid, amount):
     stats.setdefault(uid, {
@@ -96,8 +99,20 @@ def add_xp(uid, amount):
         "max_streak": 0,
         "correct_answers": 0,
         "exams_passed": 0,
-        "last_daily": 0
+        "last_daily": 0,
+        "daily_msg_xp": 0,
+        "last_msg_day": 0
     })
+
+    today = int(time.time() // 86400)
+    if stats[uid]["last_msg_day"] != today:
+        stats[uid]["last_msg_day"] = today
+        stats[uid]["daily_msg_xp"] = 0
+
+    if stats[uid]["daily_msg_xp"] >= MAX_DAILY_MSG_XP:
+        return False, stats[uid]["level"]
+
+    stats[uid]["daily_msg_xp"] += amount
 
     old_level = stats[uid]["level"]
     stats[uid]["xp"] += amount
@@ -118,10 +133,13 @@ def get_rates():
     now = time.time()
     if rates_cache["data"] and now - rates_cache["time"] < RATES_CACHE_TTL:
         return rates_cache["data"]
-    r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()
-    rates_cache["data"] = r["rates"]
-    rates_cache["time"] = now
-    return rates_cache["data"]
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()
+        rates_cache["data"] = r["rates"]
+        rates_cache["time"] = now
+        return rates_cache["data"]
+    except:
+        return None
 
 async def gemini(messages):
     loop = asyncio.get_running_loop()
@@ -130,7 +148,10 @@ async def gemini(messages):
             model="gemini-1.5-flash",
             contents=messages
         )
-    return await loop.run_in_executor(None, call)
+    try:
+        return await loop.run_in_executor(None, call)
+    except:
+        return None
 
 @router.message(CommandStart())
 async def start(m: Message):
@@ -143,12 +164,14 @@ async def start(m: Message):
         "max_streak": 0,
         "correct_answers": 0,
         "exams_passed": 0,
-        "last_daily": 0
+        "last_daily": 0,
+        "daily_msg_xp": 0,
+        "last_msg_day": 0
     })
 
     daily, level_up, lvl = check_daily(uid)
 
-    text = "Добро пожаловать!\n\n/rates\n/convert\n/exam <topic>\n/profile"
+    text = "Добро пожаловать!\n\n/rates\n/convert\n/exam <topic>\n/profile\n/mode\n/admin_stats"
 
     if daily:
         text += f"\n\n🎁 Ежедневный бонус +{DAILY_XP} XP"
@@ -156,6 +179,33 @@ async def start(m: Message):
             text += f"\n🎉 Новый уровень: {lvl}"
 
     await m.answer(text)
+
+@router.message(Command("mode"))
+async def mode_cmd(m: Message):
+    uid = str(m.from_user.id)
+    parts = m.text.split()
+    if len(parts) < 2:
+        return await m.answer("Пример: /mode assistant")
+
+    user_settings[uid] = parts[1]
+    save()
+    await m.answer(f"Режим изменен на {parts[1]}")
+
+@router.message(Command("admin_stats"))
+async def admin_stats(m: Message):
+    uid = str(m.from_user.id)
+    if uid != ADMIN_ID:
+        return
+
+    total_users = len(stats)
+    total_messages = sum(s["messages"] for s in stats.values())
+    avg_level = round(sum(s["level"] for s in stats.values()) / total_users, 2) if total_users else 0
+
+    await m.answer(
+        f"Пользователей: {total_users}\n"
+        f"Всего сообщений: {total_messages}\n"
+        f"Средний уровень: {avg_level}"
+    )
 
 @router.message(Command("profile"))
 async def profile_cmd(m: Message):
@@ -209,8 +259,9 @@ async def exam_cmd(m: Message):
         "parts": [f"Создай 1 вопрос по теме {parts[1]} без ответа"]
     }])
 
-    exam_state[uid]["last_question"] = r.text
-    await m.answer(r.text)
+    if r:
+        exam_state[uid]["last_question"] = r.text
+        await m.answer(r.text)
 
 @router.message(F.text)
 async def text_handler(m: Message):
@@ -226,44 +277,50 @@ async def text_handler(m: Message):
         "max_streak": 0,
         "correct_answers": 0,
         "exams_passed": 0,
-        "last_daily": 0
+        "last_daily": 0,
+        "daily_msg_xp": 0,
+        "last_msg_day": 0
     })
 
     stats[uid]["messages"] += 1
-    level_up, lvl = add_xp(uid, 2)
 
-    if level_up:
-        await m.answer(f"🎉 Новый уровень: {lvl}")
+    if len(m.text) > 3:
+        level_up, lvl = add_xp(uid, 2)
+        if level_up:
+            await m.answer(f"🎉 Новый уровень: {lvl}")
 
     if uid in exam_state:
         state = exam_state[uid]
 
         r = await gemini([
-            {"role": "system", "parts": ["Ответь только correct или wrong"]},
+            {"role": "system", "parts": ["Ответь строго JSON: {\"result\":\"correct\"} или {\"result\":\"wrong\"}"]},
             {"role": "user", "parts": [f"Вопрос: {state['last_question']}\nОтвет: {m.text}"]}
         ])
 
-        if "correct" in r.text.lower():
-            state["correct"] += 1
-            stats[uid]["correct_answers"] += 1
-            stats[uid]["streak"] += 1
-            stats[uid]["max_streak"] = max(stats[uid]["max_streak"], stats[uid]["streak"])
+        if r:
+            try:
+                result = json.loads(r.text)
+                if result.get("result") == "correct":
+                    state["correct"] += 1
+                    stats[uid]["correct_answers"] += 1
+                    stats[uid]["streak"] += 1
+                    stats[uid]["max_streak"] = max(stats[uid]["max_streak"], stats[uid]["streak"])
 
-            bonus = 5 if stats[uid]["streak"] % 3 == 0 else 0
-            total_xp = 15 + bonus
+                    bonus = 5 if stats[uid]["streak"] % 3 == 0 else 0
+                    total_xp = 15 + bonus
 
-            level_up, lvl = add_xp(uid, total_xp)
+                    level_up, lvl = add_xp(uid, total_xp)
 
-            msg = f"✅ Верно! +{total_xp} XP"
-            if bonus:
-                msg += f"\n🔥 Бонус за серию!"
-            if level_up:
-                msg += f"\n🎉 Новый уровень: {lvl}"
+                    msg = f"✅ Верно! +{total_xp} XP"
+                    if level_up:
+                        msg += f"\n🎉 Новый уровень: {lvl}"
 
-            await m.answer(msg)
-        else:
-            stats[uid]["streak"] = 0
-            await m.answer("❌ Неверно")
+                    await m.answer(msg)
+                else:
+                    stats[uid]["streak"] = 0
+                    await m.answer("❌ Неверно")
+            except:
+                await m.answer("Ошибка проверки ответа")
 
         state["number"] += 1
 
@@ -279,14 +336,28 @@ async def text_handler(m: Message):
             "parts": [f"Создай 1 вопрос по теме {state['topic']} без ответа"]
         }])
 
-        state["last_question"] = r.text
-        return await m.answer(r.text)
+        if r:
+            state["last_question"] = r.text
+            return await m.answer(r.text)
 
-    r = await gemini([
-        {"role": "user", "parts": [m.text]}
-    ])
+    history.setdefault(uid, [])
+    history[uid].append({"role": "user", "parts": [m.text]})
+    history[uid] = history[uid][-MAX_HISTORY:]
 
-    await m.answer(r.text)
+    mode = user_settings.get(uid, "assistant")
+    system_prompt = f"Ты работаешь в режиме {mode}"
+
+    r = await gemini(
+        [{"role": "system", "parts": [system_prompt]}] + history[uid]
+    )
+
+    if r:
+        history[uid].append({"role": "model", "parts": [r.text]})
+        history[uid] = history[uid][-MAX_HISTORY:]
+        save()
+        await m.answer(r.text)
+    else:
+        await m.answer("Ошибка AI. Попробуйте позже.")
 
 async def main():
     await dp.start_polling(bot)
