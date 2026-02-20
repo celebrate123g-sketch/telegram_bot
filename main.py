@@ -5,6 +5,7 @@ import os
 import time
 import math
 import requests
+import re
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
@@ -90,6 +91,25 @@ def get_rank(level):
         return "💎 Эксперт"
     return "👑 Мастер"
 
+def check_achievements(uid):
+    s = stats[uid]
+    s.setdefault("achievements", [])
+    new = []
+
+    if s["messages"] >= 100 and "Болтун" not in s["achievements"]:
+        s["achievements"].append("Болтун")
+        new.append("Болтун")
+
+    if s["exams_passed"] >= 10 and "Студент" not in s["achievements"]:
+        s["achievements"].append("Студент")
+        new.append("Студент")
+
+    if s["level"] >= 5 and "Растущий" not in s["achievements"]:
+        s["achievements"].append("Растущий")
+        new.append("Растущий")
+
+    return new
+
 def add_xp(uid, amount):
     stats.setdefault(uid, {
         "messages": 0,
@@ -101,7 +121,8 @@ def add_xp(uid, amount):
         "exams_passed": 0,
         "last_daily": 0,
         "daily_msg_xp": 0,
-        "last_msg_day": 0
+        "last_msg_day": 0,
+        "achievements": []
     })
 
     today = int(time.time() // 86400)
@@ -129,18 +150,6 @@ def check_daily(uid):
         return True, level_up, lvl
     return False, False, stats[uid]["level"]
 
-def get_rates():
-    now = time.time()
-    if rates_cache["data"] and now - rates_cache["time"] < RATES_CACHE_TTL:
-        return rates_cache["data"]
-    try:
-        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()
-        rates_cache["data"] = r["rates"]
-        rates_cache["time"] = now
-        return rates_cache["data"]
-    except:
-        return None
-
 async def gemini(messages):
     loop = asyncio.get_running_loop()
     def call():
@@ -166,12 +175,13 @@ async def start(m: Message):
         "exams_passed": 0,
         "last_daily": 0,
         "daily_msg_xp": 0,
-        "last_msg_day": 0
+        "last_msg_day": 0,
+        "achievements": []
     })
 
     daily, level_up, lvl = check_daily(uid)
 
-    text = "Добро пожаловать!\n\n/rates\n/convert\n/exam <topic>\n/profile\n/mode\n/admin_stats"
+    text = "Добро пожаловать!\n\n/rates\n/convert\n/exam <topic>\n/profile\n/mode\n/top\n/admin_stats"
 
     if daily:
         text += f"\n\n🎁 Ежедневный бонус +{DAILY_XP} XP"
@@ -179,33 +189,6 @@ async def start(m: Message):
             text += f"\n🎉 Новый уровень: {lvl}"
 
     await m.answer(text)
-
-@router.message(Command("mode"))
-async def mode_cmd(m: Message):
-    uid = str(m.from_user.id)
-    parts = m.text.split()
-    if len(parts) < 2:
-        return await m.answer("Пример: /mode assistant")
-
-    user_settings[uid] = parts[1]
-    save()
-    await m.answer(f"Режим изменен на {parts[1]}")
-
-@router.message(Command("admin_stats"))
-async def admin_stats(m: Message):
-    uid = str(m.from_user.id)
-    if uid != ADMIN_ID:
-        return
-
-    total_users = len(stats)
-    total_messages = sum(s["messages"] for s in stats.values())
-    avg_level = round(sum(s["level"] for s in stats.values()) / total_users, 2) if total_users else 0
-
-    await m.answer(
-        f"Пользователей: {total_users}\n"
-        f"Всего сообщений: {total_messages}\n"
-        f"Средний уровень: {avg_level}"
-    )
 
 @router.message(Command("profile"))
 async def profile_cmd(m: Message):
@@ -225,14 +208,21 @@ async def profile_cmd(m: Message):
 
     bar = progress_bar(xp_current, xp_needed)
 
+    sorted_users = sorted(stats.items(), key=lambda x: x[1]["xp"], reverse=True)
+    position = [u[0] for u in sorted_users].index(uid) + 1
+
+    achievements = ", ".join(s.get("achievements", [])) or "Нет"
+
     text = (
         f"🏆 Профиль\n\n"
+        f"Место: #{position}\n"
         f"Уровень: {level} ({get_rank(level)})\n"
         f"XP: {xp_current}/{xp_needed}\n"
         f"{bar}\n\n"
         f"Сообщений: {s['messages']}\n"
         f"Правильных ответов: {s['correct_answers']}\n"
-        f"Макс серия: {s['max_streak']}"
+        f"Макс серия: {s['max_streak']}\n"
+        f"Достижения: {achievements}"
     )
 
     await m.answer(text)
@@ -252,6 +242,7 @@ async def exam_cmd(m: Message):
         "last_question": ""
     }
 
+    save()
     await m.answer("Экзамен начат")
 
     r = await gemini([{
@@ -261,11 +252,16 @@ async def exam_cmd(m: Message):
 
     if r:
         exam_state[uid]["last_question"] = r.text
+        save()
         await m.answer(r.text)
 
 @router.message(F.text)
 async def text_handler(m: Message):
     uid = str(m.from_user.id)
+
+    if len(m.text) > 1000:
+        return await m.answer("Слишком длинное сообщение")
+
     if not flood(uid):
         return
 
@@ -279,7 +275,8 @@ async def text_handler(m: Message):
         "exams_passed": 0,
         "last_daily": 0,
         "daily_msg_xp": 0,
-        "last_msg_day": 0
+        "last_msg_day": 0,
+        "achievements": []
     })
 
     stats[uid]["messages"] += 1
@@ -288,6 +285,10 @@ async def text_handler(m: Message):
         level_up, lvl = add_xp(uid, 2)
         if level_up:
             await m.answer(f"🎉 Новый уровень: {lvl}")
+
+    new_ach = check_achievements(uid)
+    for a in new_ach:
+        await m.answer(f"🏅 Новое достижение: {a}")
 
     if uid in exam_state:
         state = exam_state[uid]
@@ -299,7 +300,12 @@ async def text_handler(m: Message):
 
         if r:
             try:
-                result = json.loads(r.text)
+                match = re.search(r'\{.*\}', r.text, re.S)
+                if match:
+                    result = json.loads(match.group())
+                else:
+                    result = {"result": "wrong"}
+
                 if result.get("result") == "correct":
                     state["correct"] += 1
                     stats[uid]["correct_answers"] += 1
@@ -318,17 +324,26 @@ async def text_handler(m: Message):
                     await m.answer(msg)
                 else:
                     stats[uid]["streak"] = 0
-                    await m.answer("❌ Неверно")
+                    explain = await gemini([
+                        {"role": "system", "parts": ["Кратко объясни почему ответ неправильный"]},
+                        {"role": "user", "parts": [f"Вопрос: {state['last_question']}\nОтвет пользователя: {m.text}"]}
+                    ])
+                    if explain:
+                        await m.answer(f"❌ Неверно\n{explain.text}")
+                    else:
+                        await m.answer("❌ Неверно")
             except:
                 await m.answer("Ошибка проверки ответа")
 
         state["number"] += 1
+        save()
 
         if state["number"] >= 5:
             percent = state["correct"] * 20
             stats[uid]["exams_passed"] += 1
             add_xp(uid, 40)
             del exam_state[uid]
+            save()
             return await m.answer(f"Экзамен завершен: {percent}%")
 
         r = await gemini([{
@@ -338,6 +353,7 @@ async def text_handler(m: Message):
 
         if r:
             state["last_question"] = r.text
+            save()
             return await m.answer(r.text)
 
     history.setdefault(uid, [])
