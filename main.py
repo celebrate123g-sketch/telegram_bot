@@ -1,18 +1,27 @@
 import asyncio
-import json
 import logging
 import os
 import time
 import math
-import requests
 import re
+import json
+import aiosqlite
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
 from aiogram.filters import CommandStart, Command
 
 from google import genai
-from config import BOT_TOKEN, GEMINI_API_KEY
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+DATABASE = "bot.db"
+FLOOD_DELAY = 1.5
+DAILY_XP = 20
+MAX_HISTORY = 10
+MAX_DAILY_MSG_XP = 100
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,40 +32,27 @@ dp.include_router(router)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-DATA_FILE = "bot_data.json"
-FLOOD_DELAY = 1.5
-RATES_CACHE_TTL = 600
-DAILY_XP = 20
-MAX_HISTORY = 10
-MAX_DAILY_MSG_XP = 100
-ADMIN_ID = "YOUR_TELEGRAM_ID"
-
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-else:
-    data = {}
-
-history = data.get("history", {})
-user_settings = data.get("user_settings", {})
-exam_state = data.get("exam_state", {})
-stats = data.get("stats", {})
-rates_cache = {"time": 0, "data": None}
 user_last_time = {}
+history = {}
 
-def save():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "history": history,
-                "user_settings": user_settings,
-                "exam_state": exam_state,
-                "stats": stats
-            },
-            f,
-            ensure_ascii=False,
-            indent=2
+async def init_db():
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            xp INTEGER,
+            level INTEGER,
+            messages INTEGER,
+            streak INTEGER,
+            max_streak INTEGER,
+            correct_answers INTEGER,
+            exams_passed INTEGER,
+            last_daily INTEGER,
+            daily_msg_xp INTEGER,
+            last_msg_day INTEGER
         )
+        """)
+        await db.commit()
 
 def flood(uid):
     now = time.time()
@@ -75,307 +71,187 @@ def calculate_level(xp):
         level += 1
     return level
 
-def progress_bar(current, total, length=10):
-    percent = current / total if total else 0
-    filled = int(length * percent)
-    return "█" * filled + "░" * (length - filled)
-
 def get_rank(level):
     if level <= 3:
-        return "🥉 Новичок"
+        return "🥉 Новичок", 1.0
     if level <= 7:
-        return "🥈 Ученик"
+        return "🥈 Ученик", 1.05
     if level <= 12:
-        return "🥇 Продвинутый"
+        return "🥇 Продвинутый", 1.1
     if level <= 20:
-        return "💎 Эксперт"
-    return "👑 Мастер"
+        return "💎 Эксперт", 1.15
+    return "👑 Мастер", 1.2
 
-def check_achievements(uid):
-    s = stats[uid]
-    s.setdefault("achievements", [])
-    new = []
+async def get_user(uid):
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                             (uid, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0))
+            await db.commit()
+            return await get_user(uid)
+        return row
 
-    if s["messages"] >= 100 and "Болтун" not in s["achievements"]:
-        s["achievements"].append("Болтун")
-        new.append("Болтун")
+async def update_user(uid, **kwargs):
+    async with aiosqlite.connect(DATABASE) as db:
+        for k, v in kwargs.items():
+            await db.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, uid))
+        await db.commit()
 
-    if s["exams_passed"] >= 10 and "Студент" not in s["achievements"]:
-        s["achievements"].append("Студент")
-        new.append("Студент")
+async def add_xp(uid, amount):
+    user = await get_user(uid)
+    xp, level = user[1], user[2]
+    rank_name, bonus = get_rank(level)
+    amount = int(amount * bonus)
+    xp += amount
+    new_level = calculate_level(xp)
+    await update_user(uid, xp=xp, level=new_level)
+    return new_level > level, new_level, amount
 
-    if s["level"] >= 5 and "Растущий" not in s["achievements"]:
-        s["achievements"].append("Растущий")
-        new.append("Растущий")
-
-    return new
-
-def add_xp(uid, amount):
-    stats.setdefault(uid, {
-        "messages": 0,
-        "xp": 0,
-        "level": 1,
-        "streak": 0,
-        "max_streak": 0,
-        "correct_answers": 0,
-        "exams_passed": 0,
-        "last_daily": 0,
-        "daily_msg_xp": 0,
-        "last_msg_day": 0,
-        "achievements": []
-    })
-
+async def check_daily(uid):
+    user = await get_user(uid)
     today = int(time.time() // 86400)
-    if stats[uid]["last_msg_day"] != today:
-        stats[uid]["last_msg_day"] = today
-        stats[uid]["daily_msg_xp"] = 0
-
-    if stats[uid]["daily_msg_xp"] >= MAX_DAILY_MSG_XP:
-        return False, stats[uid]["level"]
-
-    stats[uid]["daily_msg_xp"] += amount
-
-    old_level = stats[uid]["level"]
-    stats[uid]["xp"] += amount
-    new_level = calculate_level(stats[uid]["xp"])
-    stats[uid]["level"] = new_level
-    save()
-    return new_level > old_level, new_level
-
-def check_daily(uid):
-    today = int(time.time() // 86400)
-    if stats[uid]["last_daily"] != today:
-        stats[uid]["last_daily"] = today
-        level_up, lvl = add_xp(uid, DAILY_XP)
-        return True, level_up, lvl
-    return False, False, stats[uid]["level"]
+    if user[8] != today:
+        await update_user(uid, last_daily=today)
+        return await add_xp(uid, DAILY_XP)
+    return False, user[2], 0
 
 async def gemini(messages):
     loop = asyncio.get_running_loop()
     def call():
         return client.models.generate_content(
             model="gemini-1.5-flash",
-            contents=messages
+            contents=messages,
+            generation_config={"temperature": 0}
         )
     try:
         return await loop.run_in_executor(None, call)
     except:
         return None
 
+exam_state = {}
+
 @router.message(CommandStart())
 async def start(m: Message):
     uid = str(m.from_user.id)
-    stats.setdefault(uid, {
-        "messages": 0,
-        "xp": 0,
-        "level": 1,
-        "streak": 0,
-        "max_streak": 0,
-        "correct_answers": 0,
-        "exams_passed": 0,
-        "last_daily": 0,
-        "daily_msg_xp": 0,
-        "last_msg_day": 0,
-        "achievements": []
-    })
-
-    daily, level_up, lvl = check_daily(uid)
-
-    text = "Добро пожаловать!\n\n/rates\n/convert\n/exam <topic>\n/profile\n/mode\n/top\n/admin_stats"
-
-    if daily:
-        text += f"\n\n🎁 Ежедневный бонус +{DAILY_XP} XP"
-        if level_up:
-            text += f"\n🎉 Новый уровень: {lvl}"
-
+    await get_user(uid)
+    level_up, lvl, bonus = await check_daily(uid)
+    text = "/profile\n/top\n/exam <topic> <easy|medium|hard>"
+    if bonus:
+        text += f"\n🎁 Ежедневный бонус +{bonus} XP"
+    if level_up:
+        text += f"\n🎉 Новый уровень: {lvl}"
     await m.answer(text)
 
 @router.message(Command("profile"))
 async def profile_cmd(m: Message):
     uid = str(m.from_user.id)
-    s = stats.get(uid)
-
-    level = s["level"]
-    xp_total = s["xp"]
-
+    user = await get_user(uid)
+    xp, level = user[1], user[2]
+    rank_name, _ = get_rank(level)
     xp_needed = xp_for_next_level(level)
-    xp_current = xp_total
-    temp_level = 1
-
-    while temp_level < level:
-        xp_current -= xp_for_next_level(temp_level)
-        temp_level += 1
-
-    bar = progress_bar(xp_current, xp_needed)
-
-    sorted_users = sorted(stats.items(), key=lambda x: x[1]["xp"], reverse=True)
-    position = [u[0] for u in sorted_users].index(uid) + 1
-
-    achievements = ", ".join(s.get("achievements", [])) or "Нет"
-
-    text = (
-        f"🏆 Профиль\n\n"
-        f"Место: #{position}\n"
-        f"Уровень: {level} ({get_rank(level)})\n"
-        f"XP: {xp_current}/{xp_needed}\n"
-        f"{bar}\n\n"
-        f"Сообщений: {s['messages']}\n"
-        f"Правильных ответов: {s['correct_answers']}\n"
-        f"Макс серия: {s['max_streak']}\n"
-        f"Достижения: {achievements}"
+    temp_xp = xp
+    for i in range(1, level):
+        temp_xp -= xp_for_next_level(i)
+    percent = int((temp_xp / xp_needed) * 100)
+    bar = "█" * (percent // 10) + "░" * (10 - percent // 10)
+    await m.answer(
+        f"🏆 Уровень {level} ({rank_name})\nXP: {temp_xp}/{xp_needed}\n[{bar}] {percent}%\nСообщений: {user[3]}\nЭкзаменов: {user[7]}"
     )
 
+@router.message(Command("top"))
+async def top_cmd(m: Message):
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT user_id, xp FROM users ORDER BY xp DESC LIMIT 10")
+        rows = await cur.fetchall()
+    text = "🏆 Топ 10\n\n"
+    for i, row in enumerate(rows, 1):
+        text += f"{i}. {row[0]} — {row[1]} XP\n"
     await m.answer(text)
 
 @router.message(Command("exam"))
 async def exam_cmd(m: Message):
     parts = m.text.split()
-    if len(parts) < 2:
-        return await m.answer("Пример: /exam python")
-
+    if len(parts) < 3:
+        return await m.answer("/exam python easy")
     uid = str(m.from_user.id)
-
+    topic = parts[1]
+    difficulty = parts[2]
+    level = (await get_user(uid))[2]
+    questions = 10 if level % 10 == 0 else 5
     exam_state[uid] = {
-        "topic": parts[1],
+        "topic": topic,
+        "difficulty": difficulty,
         "number": 0,
         "correct": 0,
-        "last_question": ""
+        "total": questions
     }
-
-    save()
     await m.answer("Экзамен начат")
+    await send_question(uid, m)
 
+async def send_question(uid, m):
+    state = exam_state[uid]
     r = await gemini([{
         "role": "system",
-        "parts": [f"Создай 1 вопрос по теме {parts[1]} без ответа"]
+        "parts": [f"Создай 1 {state['difficulty']} вопрос по теме {state['topic']} без ответа"]
     }])
-
     if r:
-        exam_state[uid]["last_question"] = r.text
-        save()
+        state["question"] = r.text
         await m.answer(r.text)
 
 @router.message(F.text)
 async def text_handler(m: Message):
     uid = str(m.from_user.id)
-
-    if len(m.text) > 1000:
-        return await m.answer("Слишком длинное сообщение")
-
     if not flood(uid):
         return
-
-    stats.setdefault(uid, {
-        "messages": 0,
-        "xp": 0,
-        "level": 1,
-        "streak": 0,
-        "max_streak": 0,
-        "correct_answers": 0,
-        "exams_passed": 0,
-        "last_daily": 0,
-        "daily_msg_xp": 0,
-        "last_msg_day": 0,
-        "achievements": []
-    })
-
-    stats[uid]["messages"] += 1
-
+    user = await get_user(uid)
+    await update_user(uid, messages=user[3] + 1)
     if len(m.text) > 3:
-        level_up, lvl = add_xp(uid, 2)
+        level_up, lvl, gained = await add_xp(uid, 2)
         if level_up:
             await m.answer(f"🎉 Новый уровень: {lvl}")
-
-    new_ach = check_achievements(uid)
-    for a in new_ach:
-        await m.answer(f"🏅 Новое достижение: {a}")
-
     if uid in exam_state:
         state = exam_state[uid]
-
         r = await gemini([
-            {"role": "system", "parts": ["Ответь строго JSON: {\"result\":\"correct\"} или {\"result\":\"wrong\"}"]},
-            {"role": "user", "parts": [f"Вопрос: {state['last_question']}\nОтвет: {m.text}"]}
+            {"role": "system", "parts": ["Ответь строго JSON {\"result\":\"correct\"} или {\"result\":\"wrong\"}"]},
+            {"role": "user", "parts": [f"Вопрос: {state['question']}\nОтвет: {m.text}"]}
         ])
-
+        result = "wrong"
         if r:
-            try:
-                match = re.search(r'\{.*\}', r.text, re.S)
-                if match:
-                    result = json.loads(match.group())
-                else:
-                    result = {"result": "wrong"}
-
-                if result.get("result") == "correct":
-                    state["correct"] += 1
-                    stats[uid]["correct_answers"] += 1
-                    stats[uid]["streak"] += 1
-                    stats[uid]["max_streak"] = max(stats[uid]["max_streak"], stats[uid]["streak"])
-
-                    bonus = 5 if stats[uid]["streak"] % 3 == 0 else 0
-                    total_xp = 15 + bonus
-
-                    level_up, lvl = add_xp(uid, total_xp)
-
-                    msg = f"✅ Верно! +{total_xp} XP"
-                    if level_up:
-                        msg += f"\n🎉 Новый уровень: {lvl}"
-
-                    await m.answer(msg)
-                else:
-                    stats[uid]["streak"] = 0
-                    explain = await gemini([
-                        {"role": "system", "parts": ["Кратко объясни почему ответ неправильный"]},
-                        {"role": "user", "parts": [f"Вопрос: {state['last_question']}\nОтвет пользователя: {m.text}"]}
-                    ])
-                    if explain:
-                        await m.answer(f"❌ Неверно\n{explain.text}")
-                    else:
-                        await m.answer("❌ Неверно")
-            except:
-                await m.answer("Ошибка проверки ответа")
-
+            match = re.search(r'\{.*\}', r.text, re.S)
+            if match:
+                try:
+                    result = json.loads(match.group()).get("result", "wrong")
+                except:
+                    pass
+        if result == "correct":
+            state["correct"] += 1
+            level_up, lvl, gained = await add_xp(uid, 15)
+            await m.answer(f"✅ Верно +{gained} XP")
+            if level_up:
+                await m.answer(f"🎉 Новый уровень: {lvl}")
+        else:
+            await m.answer("❌ Неверно")
         state["number"] += 1
-        save()
-
-        if state["number"] >= 5:
-            percent = state["correct"] * 20
-            stats[uid]["exams_passed"] += 1
-            add_xp(uid, 40)
+        if state["number"] >= state["total"]:
+            percent = int(state["correct"] / state["total"] * 100)
+            await add_xp(uid, 40)
             del exam_state[uid]
-            save()
             return await m.answer(f"Экзамен завершен: {percent}%")
-
-        r = await gemini([{
-            "role": "system",
-            "parts": [f"Создай 1 вопрос по теме {state['topic']} без ответа"]
-        }])
-
-        if r:
-            state["last_question"] = r.text
-            save()
-            return await m.answer(r.text)
-
+        await send_question(uid, m)
+        return
     history.setdefault(uid, [])
     history[uid].append({"role": "user", "parts": [m.text]})
     history[uid] = history[uid][-MAX_HISTORY:]
-
-    mode = user_settings.get(uid, "assistant")
-    system_prompt = f"Ты работаешь в режиме {mode}"
-
-    r = await gemini(
-        [{"role": "system", "parts": [system_prompt]}] + history[uid]
-    )
-
+    r = await gemini(history[uid])
     if r:
         history[uid].append({"role": "model", "parts": [r.text]})
         history[uid] = history[uid][-MAX_HISTORY:]
-        save()
         await m.answer(r.text)
-    else:
-        await m.answer("Ошибка AI. Попробуйте позже.")
 
 async def main():
+    await init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
